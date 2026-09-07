@@ -90,10 +90,10 @@ describe("project registry", () => {
         .get(),
     ).toBeUndefined();
 
-    expect(listProjectRegistry({} as OpenClawConfig, options)).toEqual([
+    await expect(listProjectRegistry({} as OpenClawConfig, options)).resolves.toEqual([
       expect.objectContaining({ id: "workspace:main", source: "workspace" }),
     ]);
-    expect(listProjectRegistry({} as OpenClawConfig, options)).toHaveLength(1);
+    await expect(listProjectRegistry({} as OpenClawConfig, options)).resolves.toHaveLength(1);
 
     const rows = state.db
       .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'projects'")
@@ -126,11 +126,9 @@ describe("project registry", () => {
         ],
       },
     } as OpenClawConfig;
-    expect(listProjectRegistry(cfg, options).map((project) => project.displayName)).toEqual([
-      "alpha",
-      "OpenClaw",
-      "zeta",
-    ]);
+    expect((await listProjectRegistry(cfg, options)).map((project) => project.displayName)).toEqual(
+      ["alpha", "OpenClaw", "zeta"],
+    );
     const sharedWorkspaceCfg = {
       agents: {
         list: [
@@ -139,14 +137,14 @@ describe("project registry", () => {
         ],
       },
     } as OpenClawConfig;
-    expect(listProjectRegistry(sharedWorkspaceCfg, options).map((project) => project.id)).toEqual([
-      "openclaw",
-      "workspace:main",
-      "workspace:work",
-    ]);
-    expect(removeProjectRegistry(first.id, options)).toBe(true);
-    expect(removeProjectRegistry(first.id, options)).toBe(false);
-    expect(listProjectRegistry(cfg, options).map((project) => project.id)).not.toContain(first.id);
+    expect(
+      (await listProjectRegistry(sharedWorkspaceCfg, options)).map((project) => project.id),
+    ).toEqual(["openclaw", "workspace:main", "workspace:work"]);
+    await expect(removeProjectRegistry(first.id, options)).resolves.toBe(true);
+    await expect(removeProjectRegistry(first.id, options)).resolves.toBe(false);
+    expect((await listProjectRegistry(cfg, options)).map((project) => project.id)).not.toContain(
+      first.id,
+    );
   });
 
   it("rejects paths outside a git checkout", async () => {
@@ -219,7 +217,7 @@ describe("project registry", () => {
     );
 
     expect(added).toEqual(registered);
-    expect(listProjectRegistry({} as OpenClawConfig, options)).toHaveLength(2);
+    await expect(listProjectRegistry({} as OpenClawConfig, options)).resolves.toHaveLength(2);
   });
 
   it("serializes an existing cloned-project return with checkout deletion", async () => {
@@ -317,7 +315,7 @@ describe("project registry", () => {
     await expect(deletion).resolves.toBe(true);
     const registrationResult = await registration;
     expect(registrationResult).toMatchObject({ error: expect.any(ProjectCheckoutError) });
-    expect(listProjectRegistry({} as OpenClawConfig, options)).toEqual([
+    await expect(listProjectRegistry({} as OpenClawConfig, options)).resolves.toEqual([
       expect.objectContaining({ source: "workspace" }),
     ]);
     await expect(fs.stat(checkout)).rejects.toMatchObject({ code: "ENOENT" });

@@ -50,6 +50,7 @@ const mocks = vi.hoisted(() => ({
   getAcpSessionManager: vi.fn(() => ({})),
   fenceSessionSuspensionWritesForGatewayShutdown: vi.fn(),
   closePluginStateDatabase: vi.fn(async () => undefined),
+  closeProjectRegistryAzureSqlDatabases: vi.fn(async () => undefined),
 }));
 const WEBSOCKET_CLOSE_GRACE_MS = 1_000;
 const WEBSOCKET_CLOSE_FORCE_CONTINUE_MS = 250;
@@ -128,6 +129,13 @@ vi.mock("../plugin-state/plugin-state-store.js", async () => ({
     "../plugin-state/plugin-state-store.js",
   )),
   closePluginStateDatabase: mocks.closePluginStateDatabase,
+}));
+
+vi.mock("../storage/project-registry-store-factory.js", async () => ({
+  ...(await vi.importActual<typeof import("../storage/project-registry-store-factory.js")>(
+    "../storage/project-registry-store-factory.js",
+  )),
+  closeProjectRegistryAzureSqlDatabases: mocks.closeProjectRegistryAzureSqlDatabases,
 }));
 
 vi.mock("../logging/subsystem.js", () => ({
@@ -254,6 +262,8 @@ describe("createGatewayCloseHandler", () => {
     mocks.fenceSessionSuspensionWritesForGatewayShutdown.mockReset();
     mocks.closePluginStateDatabase.mockReset();
     mocks.closePluginStateDatabase.mockResolvedValue(undefined);
+    mocks.closeProjectRegistryAzureSqlDatabases.mockReset();
+    mocks.closeProjectRegistryAzureSqlDatabases.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -328,6 +338,19 @@ describe("createGatewayCloseHandler", () => {
     expect(deps.heartbeatRunner.stop).toHaveBeenCalledTimes(1);
     expect(deps.stopMediaCleanup).toHaveBeenCalledTimes(1);
     expect(deps.chatRunState.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it("drains Azure SQL project registry pools during the final teardown", async () => {
+    const close = createGatewayCloseHandler(createGatewayCloseTestDeps());
+
+    const result = await close({ reason: "test" });
+
+    // The Azure SQL project registry owns backend-optional pooled connections. The
+    // Gateway close owner must drain them alongside the shared SQLite teardown,
+    // even though the call is a guarded no-op when SQLite is the configured backend.
+    expect(mocks.closeProjectRegistryAzureSqlDatabases).toHaveBeenCalledTimes(1);
+    expect(mocks.closePluginStateDatabase).toHaveBeenCalledTimes(1);
+    expect(result.warnings).toStrictEqual([]);
   });
 
   it("waits for in-flight media cleanup before shutdown completes", async () => {

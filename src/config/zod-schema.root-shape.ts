@@ -34,6 +34,7 @@ import {
 } from "./zod-schema.root-support.js";
 import { sensitive } from "./zod-schema.sensitive.js";
 import { CommandsSchema, MessagesSchema, SessionSchema } from "./zod-schema.session.js";
+import { StorageConfigSchema } from "./zod-schema.storage.js";
 import { TelemetryConfigSchema } from "./zod-schema.telemetry.js";
 
 // OpenTelemetry instrument names start with an ASCII letter and allow only these characters.
@@ -251,6 +252,7 @@ export const OpenClawSchemaShape = {
     })
     .optional(),
   secrets: SecretsConfigSchema,
+  storage: StorageConfigSchema,
   auth: z
     .strictObject({
       profiles: z

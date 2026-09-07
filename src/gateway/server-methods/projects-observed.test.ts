@@ -19,7 +19,7 @@ vi.mock("../session-utils.js", () => ({
 }));
 
 vi.mock("../../projects/project-registry.js", () => ({
-  listProjectRegistry: () => [],
+  listProjectRegistry: () => Promise.resolve([]),
   ProjectCheckoutError: class ProjectCheckoutError extends Error {},
   registerProjectRegistry: vi.fn(),
   removeProjectRegistry: vi.fn(),

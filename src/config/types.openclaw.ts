@@ -21,7 +21,7 @@ import type { BroadcastConfig, CommandsConfig, MessagesConfig } from "./types.me
 import type { ModelsConfig, ModelsConfigInput } from "./types.models.js";
 import type { NodeHostConfig } from "./types.node-host.js";
 import type { PluginsConfig } from "./types.plugins.js";
-import type { SecretsConfig } from "./types.secrets.js";
+import type { SecretInput, SecretRef, SecretsConfig } from "./types.secrets.js";
 import type { SkillsConfig } from "./types.skills.js";
 import type { TelemetryConfig } from "./types.telemetry.js";
 import type { ToolsConfig } from "./types.tools.js";
@@ -70,6 +70,28 @@ export type SecurityConfig = {
       passEnv?: string[];
       trustedDirs?: string[];
     };
+  };
+};
+
+export type StorageConfig = {
+  /** Selected durable-storage backend; omitted means the local SQLite default. */
+  backend?: "sqlite" | "azuresql";
+  /** Azure SQL connection identity and endpoint settings. */
+  azureSql?: {
+    server: string;
+    database: string;
+    credential?: SecretRef;
+    authentication?:
+      | {
+          mode: "default" | "device-code";
+          tenantId?: string;
+        }
+      | {
+          mode: "sql-password";
+          username: string;
+          password: SecretInput;
+        };
+    port?: number;
   };
 };
 
@@ -190,6 +212,8 @@ export type OpenClawConfig = {
   };
   /** Secret providers, defaults, and ref-resolution settings. */
   secrets?: SecretsConfig;
+  /** Durable storage backend selection and Azure SQL settings. */
+  storage?: StorageConfig;
   /** Skill loading and bundled skill configuration. */
   skills?: SkillsConfig;
   /** Plugin registry/install/runtime configuration. */

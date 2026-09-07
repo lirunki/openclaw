@@ -23,6 +23,7 @@ import {
 } from "../../projects/project-registry.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
 import { assertPreparedSkillLibrarySelection } from "../../skills/library/selection.js";
+import { resolveProjectRegistryRuntimeOptions } from "../../storage/project-registry-runtime-options.js";
 import {
   buildDashboardSessionTitleSource,
   generateWorktreeSessionTitle,
@@ -339,7 +340,11 @@ export const sessionCreateHandlers: GatewayRequestHandlers = {
     const deferWorktree = p.worktree === true && hasInitialTurn && !existingTargetEntry;
     let projectRoot: string | undefined;
     if (requestedProjectId) {
-      const project = resolveProjectRegistry(cfg, requestedProjectId);
+      const project = await resolveProjectRegistry(
+        cfg,
+        requestedProjectId,
+        await resolveProjectRegistryRuntimeOptions(cfg),
+      );
       if (!project) {
         respond(
           false,

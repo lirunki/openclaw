@@ -18,6 +18,7 @@ export const CONFIGURE_WIZARD_SECTIONS = [
   "model",
   "web",
   "gateway",
+  "storage",
   "daemon",
   "channels",
   "plugins",
@@ -60,6 +61,7 @@ export const CONFIGURE_SECTION_OPTIONS: Array<{
   { value: "model", label: "Model", hint: "Pick provider + credentials" },
   { value: "web", label: "Web tools", hint: "Configure web search (Perplexity/Brave) + fetch" },
   { value: "gateway", label: "Gateway", hint: "Port, bind, auth, tailscale" },
+  { value: "storage", label: "Storage", hint: "Choose local SQLite or Azure SQL" },
   {
     value: "daemon",
     label: "Daemon",

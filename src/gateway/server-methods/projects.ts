@@ -37,6 +37,7 @@ import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { isTrustedSecretSurfaceUnavailableError } from "../../secrets/runtime-degraded-state.js";
 import { getSessionRepositoryWorkspaceStore } from "../../state/session-repository-workspaces.js";
 import { listProfiles, resolveUserProfileId } from "../../state/user-profiles.js";
+import { resolveProjectRegistryRuntimeOptions } from "../../storage/project-registry-runtime-options.js";
 import {
   CONTROL_UI_GITHUB_CREDENTIAL_UNAVAILABLE_MESSAGE,
   githubApiToken,
@@ -48,7 +49,7 @@ import { loadCombinedSessionStoreForGatewayCore } from "../session-utils.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
-type ProjectRegistryEntry = ReturnType<typeof listProjectRegistry>[number];
+type ProjectRegistryEntry = Awaited<ReturnType<typeof listProjectRegistry>>[number];
 type ProjectWorktreeService = Pick<
   ManagedWorktreeService,
   "listRegistryRecords" | "resolveRepositoryIdentity"
@@ -413,12 +414,13 @@ async function listObservedProjects(
   return projectCandidatesToSummaries(candidates);
 }
 
-function findProjectCheckoutReference(
+async function findProjectCheckoutReference(
   cfg: Parameters<typeof listProjectRegistry>[0],
   repoRoot: string,
-): string | undefined {
+): Promise<string | undefined> {
   const normalizedRoot = path.resolve(repoRoot);
-  const workspaceReference = listProjectRegistry(cfg).find(
+  const storageOptions = await resolveProjectRegistryRuntimeOptions(cfg);
+  const workspaceReference = (await listProjectRegistry(cfg, storageOptions)).find(
     (candidate) =>
       candidate.source === "workspace" && path.resolve(candidate.repoRoot) === normalizedRoot,
   );
@@ -456,7 +458,9 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
       if (!assertValidParams(params, validateProjectsListParams, "projects.list", respond)) {
         return;
       }
-      const registryProjects = listProjectRegistry(context.getRuntimeConfig());
+      const config = context.getRuntimeConfig();
+      const storageOptions = await resolveProjectRegistryRuntimeOptions(config);
+      const registryProjects = await listProjectRegistry(config, storageOptions);
       const projects = registryProjects.map(sanitizeProjectRecord);
       const profileId = client?.authenticatedUserProfile?.profileId;
       const canonicalProfileId = profileId
@@ -512,7 +516,7 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
         undefined,
       );
     },
-    "projects.register": async ({ params, respond }) => {
+    "projects.register": async ({ params, respond, context }) => {
       if (
         !assertValidParams(params, validateProjectsRegisterParams, "projects.register", respond)
       ) {
@@ -522,7 +526,10 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
         respond(
           true,
           sanitizeProjectRecord(
-            await registerProjectRegistry({ path: params.path, name: params.name }),
+            await registerProjectRegistry(
+              { path: params.path, name: params.name },
+              await resolveProjectRegistryRuntimeOptions(context.getRuntimeConfig()),
+            ),
           ),
           undefined,
         );
@@ -548,7 +555,11 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           true,
           await materializeProjectClone(
             { cfg: context.getRuntimeConfig(), gitUrl: params.gitUrl, name: params.name },
-            { signal, token: githubApiToken() },
+            {
+              signal,
+              token: githubApiToken(),
+              ...(await resolveProjectRegistryRuntimeOptions(context.getRuntimeConfig())),
+            },
           ),
           undefined,
         );
@@ -624,7 +635,9 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           errorShape(ErrorCodes.INVALID_REQUEST, `unknown project id: ${params.id}`),
         );
       };
-      const project = resolveProjectRegistry(context.getRuntimeConfig(), params.id);
+      const config = context.getRuntimeConfig();
+      const storageOptions = await resolveProjectRegistryRuntimeOptions(config);
+      const project = await resolveProjectRegistry(config, params.id, storageOptions);
       if (!project || project.source === "workspace") {
         respondUnknownProject();
         return;
@@ -643,17 +656,21 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           return;
         }
         try {
-          removed = await removeClonedProjectCheckout(project, () => {
-            const reference = findProjectCheckoutReference(
-              context.getRuntimeConfig(),
-              project.repoRoot,
-            );
-            if (reference) {
-              throw new ProjectCheckoutError(
-                `Project checkout is still referenced by ${reference}. Remove that reference before deleting the checkout.`,
+          removed = await removeClonedProjectCheckout(
+            project,
+            async () => {
+              const reference = await findProjectCheckoutReference(
+                context.getRuntimeConfig(),
+                project.repoRoot,
               );
-            }
-          });
+              if (reference) {
+                throw new ProjectCheckoutError(
+                  `Project checkout is still referenced by ${reference}. Remove that reference before deleting the checkout.`,
+                );
+              }
+            },
+            storageOptions,
+          );
         } catch (error) {
           respond(
             false,
@@ -668,7 +685,7 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           return;
         }
       } else {
-        removed = removeProjectRegistry(params.id);
+        removed = await removeProjectRegistry(params.id, storageOptions);
       }
       if (!removed) {
         respondUnknownProject();

@@ -4,8 +4,8 @@ import { slugifyWorktreeTitle } from "../agents/worktrees/name.js";
 import { resolveStateDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { sha256HexPrefixCore } from "../infra/crypto-digest.js";
-import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
 import { withOpenClawStateLease } from "../state/openclaw-state-lease.js";
+import type { ProjectRegistryStoreOptions } from "../storage/project-registry-store-factory.js";
 import {
   cloneProjectCheckout,
   ensureProjectCheckoutCommit,
@@ -23,12 +23,12 @@ import {
 const PROJECT_CLONE_LEASE_MS = 30_000;
 const PROJECT_CLONE_WAIT_MS = 30_000;
 
-function existingCanonicalProject(
+async function existingCanonicalProject(
   cfg: OpenClawConfig,
   canonicalUrl: string,
-  options: OpenClawStateDatabaseOptions,
-): ProjectRegistryRecord | undefined {
-  return listProjectRegistry(cfg, options).find((project) => {
+  options: ProjectRegistryStoreOptions,
+): Promise<ProjectRegistryRecord | undefined> {
+  return (await listProjectRegistry(cfg, options)).find((project) => {
     const origin = project.originUrl ? parseProjectGitUrl(project.originUrl) : null;
     return origin?.url === canonicalUrl;
   });
@@ -37,7 +37,7 @@ function existingCanonicalProject(
 /** Materializes and registers a project from an accepted GitHub remote. */
 export async function materializeProjectClone(
   input: { cfg: OpenClawConfig; gitUrl: string; name?: string; requiredCommit?: string },
-  options: OpenClawStateDatabaseOptions & {
+  options: ProjectRegistryStoreOptions & {
     signal?: AbortSignal;
     timeoutMs?: number;
     token?: string;
@@ -67,7 +67,7 @@ export async function materializeProjectClone(
       // Keep clone as the outer lease and take one candidate checkout lease at a time. A row that
       // moves roots while we wait must be retried under its new root instead of returned stale.
       while (true) {
-        const candidate = existingCanonicalProject(input.cfg, parsed.url, options);
+        const candidate = await existingCanonicalProject(input.cfg, parsed.url, options);
         if (!candidate) {
           break;
         }
@@ -75,7 +75,7 @@ export async function materializeProjectClone(
           candidate.repoRoot,
           options,
           async () => {
-            const current = existingCanonicalProject(input.cfg, parsed.url, options);
+            const current = await existingCanonicalProject(input.cfg, parsed.url, options);
             if (current?.repoRoot !== candidate.repoRoot) {
               return undefined;
             }
@@ -157,12 +157,12 @@ async function resolveClonedProjectCheckout(
 export async function removeClonedProjectCheckout(
   project: ProjectRegistryRecord,
   assertUnreferenced: () => void | Promise<void>,
-  options: OpenClawStateDatabaseOptions & { env?: NodeJS.ProcessEnv } = {},
+  options: ProjectRegistryStoreOptions = {},
 ): Promise<boolean> {
   return await withProjectCheckoutLifecycle(project.repoRoot, options, async (lease) => {
     const checkout = await resolveClonedProjectCheckout(project, options);
     await assertUnreferenced();
-    const result = removeProjectCheckoutReference(project, lease, options);
+    const result = await removeProjectCheckoutReference(project, lease, options);
     if (result === "missing") {
       return false;
     }

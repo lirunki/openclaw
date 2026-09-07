@@ -228,6 +228,55 @@ async function promptConfigureSection(
   );
 }
 
+async function configureStorageSection(
+  config: OpenClawConfig,
+  runtime: RuntimeEnv,
+): Promise<OpenClawConfig> {
+  const backend = guardCancel(
+    await select({
+      message: "Durable storage backend",
+      options: [
+        { value: "sqlite", label: "SQLite (local default)" },
+        { value: "azuresql", label: "Azure SQL (managed remote database)" },
+      ],
+      initialValue: config.storage?.backend ?? "sqlite",
+    }),
+    runtime,
+    1,
+  );
+  if (backend === "sqlite") {
+    return { ...config, storage: { backend: "sqlite" } };
+  }
+  const server = guardCancel(
+    await text({
+      message: "Azure SQL server",
+      initialValue: config.storage?.azureSql?.server ?? "",
+      validate: (value) => (value?.trim() ? undefined : "Enter an Azure SQL server hostname."),
+    }),
+    runtime,
+    1,
+  );
+  const database = guardCancel(
+    await text({
+      message: "Azure SQL database",
+      initialValue: config.storage?.azureSql?.database ?? "",
+      validate: (value) => (value?.trim() ? undefined : "Enter an Azure SQL database name."),
+    }),
+    runtime,
+    1,
+  );
+  return {
+    ...config,
+    storage: {
+      backend: "azuresql",
+      azureSql: {
+        server: server.trim(),
+        database: database.trim(),
+      },
+    },
+  };
+}
+
 async function promptChannelMode(runtime: RuntimeEnv): Promise<ChannelsWizardMode> {
   return guardCancel(
     await select({
@@ -759,6 +808,9 @@ export async function runConfigureWizard(
         gatewayPort = gateway.port;
         didConfigureGateway = true;
       },
+      storage: async () => {
+        nextConfig = await configureStorageSection(nextConfig, runtime);
+      },
       channels: configureChannelsSection,
       plugins: async () => {
         const { configurePluginConfig } = await loadSetupPluginConfigModule();
@@ -805,6 +857,7 @@ export async function runConfigureWizard(
         "model",
         "web",
         "gateway",
+        "storage",
         "channels",
         "plugins",
         "skills",

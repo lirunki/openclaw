@@ -16,6 +16,7 @@ import { closePluginStateDatabase } from "../plugin-state/plugin-state-store.js"
 import { clearActivePluginRegistry } from "../plugins/runtime.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
+import { closeProjectRegistryAzureSqlDatabases } from "../storage/project-registry-store-factory.js";
 import {
   collectGatewayProcessMemoryUsageMb,
   markGatewayRestartTrace,
@@ -614,6 +615,14 @@ export async function completeGatewayClose(
     if (mediaCleanupStopResult === "drained") {
       await shutdownStep("plugin-state-store", () => closePluginStateDatabase(), warnings);
     }
+    // The Azure SQL project registry owns backend-optional pooled connections that
+    // are not covered by the shared SQLite teardown above. Close them after project
+    // RPC work has drained; the call is a guarded no-op when SQLite is the backend.
+    await shutdownStep(
+      "project-registry-azure-sql",
+      closeProjectRegistryAzureSqlDatabases,
+      warnings,
+    );
     await shutdownStep("plugin-host-registry", clearActivePluginRegistry, warnings);
     // Channel and plugin teardown still resolve account credentials. Keep the
     // active snapshot until every teardown owner is done, then always scrub it.
