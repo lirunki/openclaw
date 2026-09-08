@@ -28,7 +28,10 @@ import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtim
 import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runCopilotAttempt } from "./attempt.js";
-import { createCopilotTestHostCapabilities } from "./host-capability.test-support.js";
+import {
+  createCopilotStableHostCapabilitiesV2026_9_2,
+  createCopilotTestHostCapabilities,
+} from "./host-capability.test-support.js";
 import type { CopilotClientPool } from "./runtime.js";
 import type { createCopilotToolBridge } from "./tool-bridge.js";
 
@@ -658,6 +661,72 @@ describe("runCopilotAttempt", () => {
     expect(result.codeModeEngaged).toBe(true);
   });
 
+  it.each(["exec", "wait"] as const)(
+    "fails stable v2026.9.2 Code Mode retaining %s before SDK session dispatch",
+    async (toolName) => {
+      initializeGlobalHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "before_prompt_build",
+            handler: () => ({ toolsAllow: [toolName] }),
+          },
+        ]),
+      );
+      const sdk = makeFakeSdk();
+      const pool = makeFakePool(sdk);
+
+      const result = await runCopilotAttempt(
+        makeParams({
+          config: { tools: { codeMode: true } },
+          disableTools: false,
+          hostCapabilities: createCopilotStableHostCapabilitiesV2026_9_2(),
+          initialReplayState:
+            toolName === "wait"
+              ? { journalValidated: true, sdkSessionId: "existing-session" }
+              : undefined,
+        } as never),
+        { pool },
+      );
+
+      expect(
+        (projectAgentRunAttemptTerminal(result.terminal).promptError as Error | undefined)?.message,
+      ).toContain("Code Mode requires host provider transcript commit capability");
+      expect(pool.acquire).toHaveBeenCalledOnce();
+      expect(sdk.createSession).not.toHaveBeenCalled();
+      expect(sdk.resumeSession).not.toHaveBeenCalled();
+      expect(sdk.sessions).toEqual([]);
+    },
+  );
+
+  it("allows stable v2026.9.2 hosts when the final hook removes Code Mode controls", async () => {
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_prompt_build",
+          handler: () => ({ toolsAllow: [] }),
+        },
+      ]),
+    );
+    const sdk = makeFakeSdk();
+    const pool = makeFakePool(sdk);
+
+    const result = await runCopilotAttempt(
+      makeParams({
+        config: { tools: { codeMode: true } },
+        disableTools: false,
+        hostCapabilities: createCopilotStableHostCapabilitiesV2026_9_2(),
+      } as never),
+      { pool },
+    );
+
+    expect(projectAgentRunAttemptTerminal(result.terminal).promptError).toBeNull();
+    expect(pool.acquire).toHaveBeenCalledOnce();
+    expect(sdk.createSession).toHaveBeenCalledOnce();
+    expect(sdk.resumeSession).not.toHaveBeenCalled();
+    expect((requireCreateSessionConfig(sdk) as { tools?: SdkTool[] }).tools).toEqual([]);
+    expect(requireSession(sdk).sendAndWait).toHaveBeenCalledOnce();
+  });
+
   it("reports the tool bridge's code-mode engagement on the attempt result", async () => {
     const sdk = makeFakeSdk((session) => {
       session.sendAndWait.mockResolvedValueOnce(makeAssistantMessageEvent("done"));
@@ -978,12 +1047,17 @@ describe("runCopilotAttempt", () => {
     const pool = makeFakePool(sdk);
 
     const result = await runCopilotAttempt(
-      makeParams({ initialReplayState: { sdkSessionId: "legacy-session" } as never }),
+      makeParams({
+        initialReplayState: {
+          journalValidated: true,
+          sdkSessionId: "legacy-session",
+        } as never,
+      }),
       { pool },
     );
 
     expect(result.terminal).toEqual({ kind: "ok" });
-    expect(result.replayMetadata.replaySafe).toBe(false);
+    expect(result.replayMetadata.replaySafe).toBe(true);
     expect(
       (result as AgentHarnessAttemptResult & { journalValidated?: boolean }).journalValidated,
     ).toBe(false);
@@ -1499,6 +1573,25 @@ describe("runCopilotAttempt", () => {
     });
   });
 
+  it("replay-shim: an unvalidated stored session starts fresh without deleting stale history", async () => {
+    const sdk = makeFakeSdk();
+    const pool = makeFakePool(sdk);
+
+    const result = await runCopilotAttempt(
+      makeParams({ initialReplayState: { sdkSessionId: "stable-v2026.9.2-session" } as never }),
+      { pool },
+    );
+
+    expect(sdk.resumeSession).not.toHaveBeenCalled();
+    expect(sdk.createSession).toHaveBeenCalledTimes(1);
+    expect(sdk.client.deleteSession).not.toHaveBeenCalled();
+    expect(getSdkSessionId(result)).not.toBe("stable-v2026.9.2-session");
+    expect(result.replayMetadata).toEqual({
+      hadPotentialSideEffects: false,
+      replaySafe: false,
+    });
+  });
+
   it("replay-shim: recovers from missing-session resume failure by downgrading to createSession", async () => {
     let resumeCalls = 0;
     const sdk = makeFakeSdk({
@@ -1513,7 +1606,9 @@ describe("runCopilotAttempt", () => {
     const pool = makeFakePool(sdk);
 
     const result = await runCopilotAttempt(
-      makeParams({ initialReplayState: { sdkSessionId: "resume-gone" } as never }),
+      makeParams({
+        initialReplayState: { journalValidated: true, sdkSessionId: "resume-gone" } as never,
+      }),
       { pool },
     );
 
@@ -1538,7 +1633,9 @@ describe("runCopilotAttempt", () => {
     const pool = makeFakePool(sdk);
 
     const result = await runCopilotAttempt(
-      makeParams({ initialReplayState: { sdkSessionId: "resume-x" } as never }),
+      makeParams({
+        initialReplayState: { journalValidated: true, sdkSessionId: "resume-x" } as never,
+      }),
       { pool },
     );
 
@@ -1865,7 +1962,7 @@ describe("runCopilotAttempt", () => {
 
     await runCopilotAttempt(
       makeParams({
-        initialReplayState: { sdkSessionId: "resume-target" } as never,
+        initialReplayState: { journalValidated: true, sdkSessionId: "resume-target" } as never,
       }),
       { createToolBridge, pool },
     );
@@ -2432,7 +2529,7 @@ describe("runCopilotAttempt", () => {
     await runCopilotAttempt(
       makeParams({
         enableSessionTelemetry: false,
-        initialReplayState: { sdkSessionId: "resume-2" },
+        initialReplayState: { journalValidated: true, sdkSessionId: "resume-2" },
       } as never),
       { pool },
     );
@@ -2684,7 +2781,12 @@ describe("runCopilotAttempt", () => {
       const pool = makeFakePool(sdk);
 
       await runCopilotAttempt(
-        makeParams({ initialReplayState: { sdkSessionId: "sess-resume-1" } } as never),
+        makeParams({
+          initialReplayState: {
+            journalValidated: true,
+            sdkSessionId: "sess-resume-1",
+          },
+        } as never),
         { pool },
       );
 
@@ -2752,7 +2854,7 @@ describe("runCopilotAttempt", () => {
     await runCopilotAttempt(
       makeParams({
         infiniteSessionConfig: { backgroundCompactionThreshold: 0.5 },
-        initialReplayState: { sdkSessionId: "resume-3" },
+        initialReplayState: { journalValidated: true, sdkSessionId: "resume-3" },
       } as never),
       { pool },
     );
@@ -3430,7 +3532,10 @@ describe("runCopilotAttempt", () => {
           auth: {} as never,
           resolvedApiKey: "contract-token-resume",
           authProfileId: "github-copilot:main",
-          initialReplayState: { sdkSessionId: "resume-target" } as never,
+          initialReplayState: {
+            journalValidated: true,
+            sdkSessionId: "resume-target",
+          } as never,
         } as never),
         { pool },
       );
@@ -3455,7 +3560,10 @@ describe("runCopilotAttempt", () => {
           } as never,
           resolvedApiKey: "byok-token",
           authProfileId: "custom-openai:main",
-          initialReplayState: { sdkSessionId: "resume-target" } as never,
+          initialReplayState: {
+            journalValidated: true,
+            sdkSessionId: "resume-target",
+          } as never,
         } as never),
         { pool },
       );
@@ -4858,7 +4966,12 @@ describe("runCopilotAttempt", () => {
       const createToolBridge = vi.fn(async () => createStubToolBridge(sdkTools));
 
       await runCopilotAttempt(
-        makeParams({ initialReplayState: { sdkSessionId: "sess-resume-1" } } as never),
+        makeParams({
+          initialReplayState: {
+            journalValidated: true,
+            sdkSessionId: "sess-resume-1",
+          },
+        } as never),
         { createToolBridge, pool },
       );
 
@@ -4879,7 +4992,10 @@ describe("runCopilotAttempt", () => {
 
       await runCopilotAttempt(
         makeParams({
-          initialReplayState: { sdkSessionId: "sess-restricted" },
+          initialReplayState: {
+            journalValidated: true,
+            sdkSessionId: "sess-restricted",
+          },
           pluginHarnessToolPolicyRestricted: true,
         } as never),
         { createToolBridge, pool },
@@ -4900,7 +5016,10 @@ describe("runCopilotAttempt", () => {
 
       await runCopilotAttempt(
         makeParams({
-          initialReplayState: { sdkSessionId: "sess-openclaw" },
+          initialReplayState: {
+            journalValidated: true,
+            sdkSessionId: "sess-openclaw",
+          },
           toolsAllow: ["openclaw"],
         } as never),
         {
@@ -4925,7 +5044,12 @@ describe("runCopilotAttempt", () => {
       const createToolBridge = vi.fn(async () => createStubToolBridge());
 
       await runCopilotAttempt(
-        makeParams({ initialReplayState: { sdkSessionId: "sess-resume-2" } } as never),
+        makeParams({
+          initialReplayState: {
+            journalValidated: true,
+            sdkSessionId: "sess-resume-2",
+          },
+        } as never),
         { createToolBridge, pool },
       );
 
