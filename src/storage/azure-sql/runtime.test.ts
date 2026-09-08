@@ -34,6 +34,7 @@ function createFakePoolFactory(
     connectError?: { code: string; message: string };
     queryResult?: FakeRequestResult;
     transactionResult?: FakeRequestResult;
+    commitError?: Error;
     onConfig?: (config: unknown) => void;
   } = {},
 ): AzureSqlPoolFactory {
@@ -67,6 +68,9 @@ function createFakePoolFactory(
           },
           async commit() {
             committed = true;
+            if (options.commitError) {
+              throw options.commitError;
+            }
           },
           async rollback() {
             rolledBack = true;
@@ -189,6 +193,39 @@ describe("AzureSqlDatabase", () => {
 
     expect(committed).toBe(true);
     expect(rolledBack).toBe(false);
+  });
+
+  it("surfaces an ambiguous commit after best-effort cleanup without marking it retryable", async () => {
+    let rolledBack = false;
+    const factory: AzureSqlPoolFactory = (config) => {
+      const pool = createFakePoolFactory({
+        commitError: Object.assign(new Error("connection lost after commit request"), {
+          code: "ESOCKET",
+        }),
+      })(config);
+      const transaction = pool.transaction.bind(pool);
+      pool.transaction = () => {
+        const current = transaction();
+        const rollback = current.rollback.bind(current);
+        current.rollback = async () => {
+          rolledBack = true;
+          await rollback();
+        };
+        return current;
+      };
+      return pool;
+    };
+    const database = new AzureSqlDatabase(
+      { server: "localhost", database: "openclaw-test" },
+      factory,
+    );
+
+    const error = await database
+      .transaction(async () => "written")
+      .catch((value: unknown) => value);
+    expect(error).toMatchObject({ kind: "ambiguous-commit", retryable: false });
+    expect((error as Error).message).toContain("reconcile before retrying");
+    expect(rolledBack).toBe(true);
   });
 
   it("rolls back when a transaction operation fails", async () => {

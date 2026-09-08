@@ -16,6 +16,7 @@ import {
 } from "../../agents/worktrees/service.js";
 import type { ManagedWorktreeService } from "../../agents/worktrees/service.js";
 import { resolveRecordedProjectRoot } from "../../projects/project-registry.js";
+import { resolveProjectRegistryRuntimeOptions } from "../../storage/project-registry-runtime-options.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { resolveWorkspacePathContainment } from "./workspace-path-containment.js";
@@ -38,12 +39,15 @@ async function resolveAuthorizedRepoRoot(
   if (scopes.includes(ADMIN_SCOPE)) {
     return repoRoot;
   }
-  const containment = await resolveWorkspacePathContainment(
-    repoRoot,
-    opts.context.getRuntimeConfig(),
-  );
+  const config = opts.context.getRuntimeConfig();
+  const containment = await resolveWorkspacePathContainment(repoRoot, config);
   // A stored project row authorizes its canonical repo root for write-scoped clients.
-  const authorizedRoot = containment?.path ?? (await resolveRecordedProjectRoot(repoRoot));
+  const authorizedRoot =
+    containment?.path ??
+    (await resolveRecordedProjectRoot(
+      repoRoot,
+      await resolveProjectRegistryRuntimeOptions(config),
+    ));
   if (authorizedRoot) {
     return authorizedRoot;
   }

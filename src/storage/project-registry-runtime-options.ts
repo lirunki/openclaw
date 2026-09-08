@@ -1,37 +1,44 @@
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { coerceSecretRef } from "../config/types.secrets.js";
 import { resolveSecretRefString } from "../secrets/resolve.js";
 import type { ProjectRegistryStoreOptions } from "./project-registry-store-factory.js";
 
-export async function resolveProjectRegistryRuntimeOptions(
+const processRuntimeOptions = new WeakMap<OpenClawConfig, Promise<ProjectRegistryStoreOptions>>();
+
+export function resolveProjectRegistryRuntimeOptions(
   config: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<ProjectRegistryStoreOptions> {
-  const storage = config.storage;
-  const authentication = storage?.azureSql?.authentication;
-  if (!storage || authentication?.mode !== "sql-password") {
-    return storage ? { storage } : {};
+  if (env !== process.env) {
+    return materializeProjectRegistryRuntimeOptions(config, env);
   }
-  const inlinePassword = normalizeOptionalString(authentication.password);
-  const password = inlinePassword ?? (await resolveConfiguredPassword(config, env));
-  return {
-    storage,
-    azureSqlPassword: { username: authentication.username, password },
-  };
+  const existing = processRuntimeOptions.get(config);
+  if (existing) {
+    return existing;
+  }
+  const resolved = materializeProjectRegistryRuntimeOptions(config, env);
+  processRuntimeOptions.set(config, resolved);
+  void resolved.catch(() => processRuntimeOptions.delete(config));
+  return resolved;
 }
 
-async function resolveConfiguredPassword(
+async function materializeProjectRegistryRuntimeOptions(
   config: OpenClawConfig,
   env: NodeJS.ProcessEnv,
-): Promise<string> {
-  const authentication = config.storage?.azureSql?.authentication;
+): Promise<ProjectRegistryStoreOptions> {
+  const storage = config.storage;
+  if (!storage) {
+    return {};
+  }
+  const authentication = storage.azureSql?.authentication;
+  const azureSqlSecretResolver = async (ref: Parameters<typeof resolveSecretRefString>[0]) =>
+    await resolveSecretRefString(ref, { config, env });
   if (authentication?.mode !== "sql-password") {
-    throw new Error("Azure SQL password authentication is not configured");
+    return storage.azureSql?.credential ? { storage, azureSqlSecretResolver } : { storage };
   }
-  const ref = coerceSecretRef(authentication.password);
-  if (!ref) {
-    throw new Error("Azure SQL password is missing or invalid");
-  }
-  return await resolveSecretRefString(ref, { config, env });
+  const password = await azureSqlSecretResolver(authentication.password);
+  return {
+    storage,
+    azureSqlSecretResolver,
+    azureSqlPassword: { username: authentication.username, password },
+  };
 }

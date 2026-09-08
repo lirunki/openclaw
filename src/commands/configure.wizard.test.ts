@@ -85,6 +85,44 @@ describe("runConfigureWizard", () => {
     },
   );
 
+  it("preserves Azure SQL authentication and port when updating its endpoint", async () => {
+    setupBaseWizardState({
+      storage: {
+        backend: "azuresql",
+        azureSql: {
+          server: "old.database.invalid",
+          database: "old-database",
+          port: 1444,
+          authentication: {
+            mode: "sql-password",
+            username: "openclaw",
+            password: { source: "env", provider: "default", id: "AZURE_SQL_PASSWORD" },
+          },
+        },
+      },
+    });
+    queueWizardPrompts({ select: ["azuresql"], confirm: [] });
+    mocks.clackText
+      .mockResolvedValueOnce("new.database.invalid")
+      .mockResolvedValueOnce("new-database");
+
+    await runConfigureWizard({ command: "configure", sections: ["storage"] }, createRuntime());
+
+    expect(requireWriteConfig().storage).toEqual({
+      backend: "azuresql",
+      azureSql: {
+        server: "new.database.invalid",
+        database: "new-database",
+        port: 1444,
+        authentication: {
+          mode: "sql-password",
+          username: "openclaw",
+          password: { source: "env", provider: "default", id: "AZURE_SQL_PASSWORD" },
+        },
+      },
+    });
+  });
+
   it("persists provider-owned web search config changes returned by setupSearch", async () => {
     setupBaseWizardState();
     mocks.setupSearch.mockImplementation(async (cfg: OpenClawConfig) => {

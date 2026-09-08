@@ -270,6 +270,7 @@ async function configureStorageSection(
     storage: {
       backend: "azuresql",
       azureSql: {
+        ...config.storage?.azureSql,
         server: server.trim(),
         database: database.trim(),
       },

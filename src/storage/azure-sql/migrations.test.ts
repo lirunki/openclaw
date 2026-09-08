@@ -95,6 +95,23 @@ describe("runAzureSqlMigrations", () => {
     });
     expect(database.commits).toBe(2);
     expect(database.rollbacks).toBe(0);
+    expect(database.executedSql[0]).toContain("sp_getapplock");
+    expect(database.executedSql[1]).toContain("CREATE SCHEMA");
+  });
+
+  it("rejects migrations recorded by a newer build", async () => {
+    const database = new FakeMigrationDatabase();
+    database.applied.set("global.projects.v2", {
+      version: 2,
+      checksum_sha256: "newer-checksum",
+    });
+
+    await expect(
+      runAzureSqlMigrations(database as unknown as AzureSqlDatabase, [
+        { id: "global.projects.v1", version: 1, sql: "CREATE TABLE projects_v1 (id int);" },
+      ]),
+    ).rejects.toThrow("newer than this build");
+    expect(database.rollbacks).toBe(1);
   });
 
   it("rejects migration checksum drift", async () => {

@@ -96,9 +96,17 @@ export async function runAzureSqlMigrations(
 ): Promise<AzureSqlMigrationResult> {
   const ordered = validateMigrations(migrations);
   return await database.transaction(async (transaction) => {
-    await transaction.query(MIGRATION_TABLE_SQL);
+    // The application lock has no schema dependency, so it must serialize the first bootstrap DDL too.
     await transaction.query(ACQUIRE_MIGRATION_LOCK_SQL);
+    await transaction.query(MIGRATION_TABLE_SQL);
     const applied = await readAppliedMigrations(transaction);
+    const knownIds = new Set(ordered.map((migration) => migration.id));
+    const unknownApplied = [...applied.keys()].filter((id) => !knownIds.has(id)).toSorted();
+    if (unknownApplied.length > 0) {
+      throw new Error(
+        `Azure SQL schema contains migrations newer than this build: ${unknownApplied.join(", ")}`,
+      );
+    }
     const result: AzureSqlMigrationResult = { applied: [], alreadyApplied: [] };
     for (const migration of ordered) {
       const checksum = migrationChecksum(migration.sql);

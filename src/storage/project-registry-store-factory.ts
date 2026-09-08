@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { StorageConfig } from "../config/types.openclaw.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
 import {
@@ -21,13 +22,33 @@ export type ProjectRegistryStoreOptions = OpenClawStateDatabaseOptions & {
   azureSqlPassword?: { username: string; password: string };
 };
 
-const azureSqlDatabases = new Map<string, AzureSqlDatabase>();
+type AzureSqlProjectStoreEntry = {
+  database: AzureSqlDatabase;
+  store: AzureSqlProjectRegistryStore;
+};
 
-function azureSqlDatabaseKey(config: NonNullable<StorageConfig["azureSql"]>): string {
-  return `${config.server}\u0000${config.database}\u0000${config.port ?? ""}`;
+const azureSqlProjectStores = new Map<string, AzureSqlProjectStoreEntry>();
+
+function azureSqlStoreKey(
+  config: NonNullable<StorageConfig["azureSql"]>,
+  options: ProjectRegistryStoreOptions,
+): string {
+  const authentication = config.authentication;
+  const authenticationIdentity = options.azureSqlCredential
+    ? "injected-token"
+    : options.azureSqlPassword
+      ? `sql-password:${options.azureSqlPassword.username}:${createHash("sha256").update(options.azureSqlPassword.password).digest("hex")}`
+      : config.credential
+        ? `secret-token:${config.credential.source}:${config.credential.provider}:${config.credential.id}`
+        : authentication?.mode === "device-code"
+          ? `device-code:${authentication.tenantId ?? ""}`
+          : "default-token";
+  return `${config.server}\u0000${config.database}\u0000${config.port ?? ""}\u0000${authenticationIdentity}`;
 }
 
-function getAzureSqlDatabase(options: ProjectRegistryStoreOptions): AzureSqlDatabase {
+function getAzureSqlProjectStore(
+  options: ProjectRegistryStoreOptions,
+): AzureSqlProjectRegistryStore {
   const storage = options.storage;
   assertStorageBackendConfig(storage);
   const azureSql = storage?.azureSql;
@@ -39,10 +60,10 @@ function getAzureSqlDatabase(options: ProjectRegistryStoreOptions): AzureSqlData
       "Azure SQL credential is configured but has not been resolved by the storage runtime",
     );
   }
-  const key = azureSqlDatabaseKey(azureSql);
-  const existing = azureSqlDatabases.get(key);
+  const key = azureSqlStoreKey(azureSql, options);
+  const existing = azureSqlProjectStores.get(key);
   if (existing) {
-    return existing;
+    return existing.store;
   }
   if (azureSql.authentication?.mode === "sql-password" && !options.azureSqlPassword) {
     throw new Error(
@@ -64,8 +85,9 @@ function getAzureSqlDatabase(options: ProjectRegistryStoreOptions): AzureSqlData
     ...(credential ? { credential } : {}),
     ...(options.azureSqlPassword ? { sqlPassword: options.azureSqlPassword } : {}),
   });
-  azureSqlDatabases.set(key, database);
-  return database;
+  const store = new AzureSqlProjectRegistryStore(database);
+  azureSqlProjectStores.set(key, { database, store });
+  return store;
 }
 
 export function createProjectRegistryStore(
@@ -76,11 +98,11 @@ export function createProjectRegistryStore(
   ) {
     return createSqliteProjectRegistryStore(options);
   }
-  return new AzureSqlProjectRegistryStore(getAzureSqlDatabase(options));
+  return getAzureSqlProjectStore(options);
 }
 
 export async function closeProjectRegistryAzureSqlDatabases(): Promise<void> {
-  const databases = [...azureSqlDatabases.values()];
-  azureSqlDatabases.clear();
-  await Promise.all(databases.map((database) => database.close()));
+  const entries = [...azureSqlProjectStores.values()];
+  azureSqlProjectStores.clear();
+  await Promise.all(entries.map(({ database }) => database.close()));
 }

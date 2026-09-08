@@ -75,6 +75,7 @@ type AzureSqlFailureKind =
   | "connection"
   | "cancellation"
   | "request"
+  | "ambiguous-commit"
   | "unknown";
 
 class AzureSqlStorageError extends Error {
@@ -321,6 +322,7 @@ export class AzureSqlDatabase {
   async transaction<T>(operation: (transaction: AzureSqlTransaction) => Promise<T>): Promise<T> {
     await this.connect();
     const transaction = this.pool.transaction();
+    let commitStarted = false;
     try {
       await transaction.begin(mssql.ISOLATION_LEVEL.READ_COMMITTED);
       const result = await operation({
@@ -334,9 +336,23 @@ export class AzureSqlDatabase {
           }
         },
       });
+      commitStarted = true;
       await transaction.commit();
       return result;
     } catch (error) {
+      if (commitStarted) {
+        // A failed commit response is ambiguous. Rollback is cleanup only: whether it succeeds or
+        // reports that the transaction already ended must not change the reconciliation outcome.
+        await transaction.rollback().catch(() => undefined);
+        throw new AzureSqlStorageError(
+          "Azure SQL commit outcome is unknown; reconcile before retrying.",
+          {
+            kind: "ambiguous-commit",
+            retryable: false,
+            cause: error,
+          },
+        );
+      }
       try {
         await transaction.rollback();
       } catch (rollbackError) {

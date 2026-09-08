@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { AzureSqlProjectRegistryStore } from "./project-registry-store.js";
 import type { AzureSqlRequest, AzureSqlResult, AzureSqlTransaction } from "./runtime.js";
@@ -35,6 +36,7 @@ class FakeRequest implements AzureSqlRequest {
 
 class FakeProjectDatabase {
   readonly rows: FakeProjectRow[] = [];
+  readonly executedSql: string[] = [];
   leaseOwner: string | undefined;
   leaseExpiresAtMs = 0;
   schemaEnsures = 0;
@@ -69,29 +71,26 @@ class FakeProjectDatabase {
   ): Promise<AzureSqlResult<Row>> {
     const request = new FakeRequest();
     bind?.(request);
+    this.executedSql.push(text);
     if (text.includes("project_checkout_leases") && !text.includes("CREATE TABLE")) {
       if (text.includes("SELECT owner_id")) {
         const ownerId = String(request.values.get("ownerId"));
         const valid = this.leaseOwner === ownerId && this.leaseExpiresAtMs > Date.now();
-        return fakeResult<Row>(
-          valid ? [{ owner_id: ownerId, expires_at_ms: this.leaseExpiresAtMs }] : [],
-        );
+        return fakeResult<Row>(valid ? [{ owner_id: ownerId }] : []);
       }
-      if (text.includes("SELECT owner_id, expires_at_ms")) {
+      if (text.includes("SELECT CAST(CASE")) {
         return fakeResult<Row>(
-          this.leaseOwner
-            ? [{ owner_id: this.leaseOwner, expires_at_ms: this.leaseExpiresAtMs }]
-            : [],
+          this.leaseOwner ? [{ is_active: this.leaseExpiresAtMs > Date.now() }] : [],
         );
       }
       if (text.includes("INSERT INTO")) {
         this.leaseOwner = String(request.values.get("ownerId"));
-        this.leaseExpiresAtMs = Number(request.values.get("expiresAtMs"));
+        this.leaseExpiresAtMs = Date.now() + 30_000;
         return fakeResult<Row>([], [1]);
       }
       if (text.includes("UPDATE")) {
         this.leaseOwner = String(request.values.get("ownerId"));
-        this.leaseExpiresAtMs = Number(request.values.get("expiresAtMs"));
+        this.leaseExpiresAtMs = Date.now() + 30_000;
         return fakeResult<Row>([], [1]);
       }
       if (text.includes("DELETE FROM")) {
@@ -150,11 +149,11 @@ class FakeProjectDatabase {
       const id = String(request.values.get("id"));
       return fakeResult<Row>(this.rows.filter((row) => row.id === id));
     }
-    if (text.includes("WHERE repo_root = @repoRoot")) {
+    if (text.includes("repo_root = @repoRoot")) {
       const repoRoot = String(request.values.get("repoRoot"));
       return fakeResult<Row>(this.rows.filter((row) => row.repo_root === repoRoot));
     }
-    if (text.includes("WHERE origin_url = @originUrl")) {
+    if (text.includes("origin_url = @originUrl")) {
       const originUrl = String(request.values.get("originUrl"));
       return fakeResult<Row>(this.rows.filter((row) => row.origin_url === originUrl));
     }
@@ -198,7 +197,40 @@ describe("AzureSqlProjectRegistryStore", () => {
     expect(await store.findById(first.id)).toEqual(first);
     expect(await store.list()).toEqual([first]);
     expect(database.commits).toBe(3);
-    expect(database.schemaEnsures).toBe(1);
+    expect(database.schemaEnsures).toBe(2);
+    const v1SchemaSql = database.executedSql.find((sql) =>
+      sql.includes("IX_openclaw_projects_repo_root ON"),
+    );
+    const v2SchemaSql = database.executedSql.find((sql) =>
+      sql.includes("CREATE TABLE [openclaw_global].[projects_v2]"),
+    );
+    expect(
+      createHash("sha256")
+        .update(v1SchemaSql ?? "")
+        .digest("hex"),
+    ).toBe("38536598d4896e9a5240083a87696d757d2d96e574db3f0c6a3d1538ef099fbf");
+    expect(v1SchemaSql).toContain("ON [openclaw_global].[projects](repo_root)");
+    expect(v2SchemaSql).toContain("Latin1_General_100_BIN2");
+    expect(v2SchemaSql).toContain("repo_root_hash binary(32)");
+    expect(v2SchemaSql).toContain("HASHBYTES('SHA2_256'");
+  });
+
+  it("keeps case-distinct Linux paths as separate identities", async () => {
+    const database = new FakeProjectDatabase();
+    const store = new AzureSqlProjectRegistryStore(database);
+
+    const upper = await store.insertOrGet(
+      { displayName: "Upper", repoRoot: "/workspace/Repo", source: "registered" },
+      lease,
+    );
+    const lower = await store.insertOrGet(
+      { displayName: "Lower", repoRoot: "/workspace/repo", source: "registered" },
+      lease,
+    );
+
+    expect(lower.id).not.toBe(upper.id);
+    await expect(store.findByRepoRoot("/workspace/Repo")).resolves.toEqual(upper);
+    await expect(store.findByRepoRoot("/workspace/repo")).resolves.toEqual(lower);
   });
 
   it("runs the Azure checkout lease lifecycle on the same backend", async () => {
@@ -208,11 +240,21 @@ describe("AzureSqlProjectRegistryStore", () => {
     await expect(
       store.withCheckoutLease("/workspace/openclaw", async (checkoutLease) => {
         checkoutLease.assertOwned();
+        await store.insertOrGet(
+          {
+            displayName: "OpenClaw",
+            repoRoot: "/workspace/openclaw",
+            source: "registered",
+          },
+          checkoutLease,
+        );
         return "leased";
       }),
     ).resolves.toBe("leased");
     expect(database.leaseOwner).toBeUndefined();
     expect(database.rollbacks).toBe(0);
+    expect(database.executedSql.some((sql) => sql.includes("SYSUTCDATETIME()"))).toBe(true);
+    expect(database.executedSql.some((sql) => sql.includes("lease_key_hash"))).toBe(true);
   });
 
   it("removes the final checkout reference transactionally", async () => {

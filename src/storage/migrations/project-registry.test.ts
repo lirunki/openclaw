@@ -93,6 +93,58 @@ describe("migrateProjectRegistry", () => {
     expect(target.leaseCount).toBe(0);
   });
 
+  it("rejects target rows that would silently replace a source identity", async () => {
+    const source = new MemoryProjectStore();
+    source.rows.set("source-id", {
+      id: "source-id",
+      displayName: "Source",
+      repoRoot: "/shared",
+      source: "registered",
+    });
+    const target = new MemoryProjectStore();
+    target.rows.set("target-id", {
+      id: "target-id",
+      displayName: "Target",
+      repoRoot: "/shared",
+      source: "registered",
+    });
+
+    await expect(
+      migrateProjectRegistry({
+        source,
+        target,
+        mode: "dry-run",
+        assertSourceStopped: () => {},
+      }),
+    ).rejects.toThrow("migration conflict");
+  });
+
+  it("rejects an insert that deduplicates to a different canonical row", async () => {
+    const source = new MemoryProjectStore();
+    source.rows.set("source-id", {
+      id: "source-id",
+      displayName: "Source",
+      repoRoot: "/source",
+      source: "cloned",
+    });
+    const target = new MemoryProjectStore();
+    target.insertOrGet = async () => ({
+      id: "other-id",
+      displayName: "Other",
+      repoRoot: "/other",
+      source: "cloned",
+    });
+
+    await expect(
+      migrateProjectRegistry({
+        source,
+        target,
+        mode: "execute",
+        assertSourceStopped: () => {},
+      }),
+    ).rejects.toThrow("migration conflict");
+  });
+
   it("copies canonical rows with stable ids after the source-stop gate", async () => {
     const source = new MemoryProjectStore();
     source.rows.set("stable-id", {

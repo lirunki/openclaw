@@ -1218,40 +1218,6 @@ Before each release that changes either backend:
 - Security review covers credentials, tenancy, and artifact metadata.
 - Rollback procedure is documented and exercised.
 
-## Current-main validation evidence
-
-This section records the focused validation run executed on the current-main port (uncommitted on top of `origin/main` SHA `61d957a9cb64bd8c70cc125e644778b3fb034c49`). It does not supersede the per-phase evidence above; it summarizes the consolidated current-main proof for the ported first slice and its supporting wiring.
-
-**Focused test totals across 22 files (263 total):**
-
-```text
-storage        21
-config          4
-project        24
-migration       4
-configure      70
-Gateway projects 30
-session create 23
-protocol       21
-server-close   66
-------------------
-total         263
-```
-
-**Native check-changed:** all 32 lanes passed.
-
-**Static checks:** typecheck, lint, deadcode, import-cycle, and build all passed on the current-main port.
-
-**Config baseline (current main):**
-
-```text
-core    = 2435
-channel = 3710
-plugin  = 4052
-```
-
-**Remaining boundary:** the only outstanding live boundary is the Azure SQL project registry live proof; all other stores remain SQLite-only on current main. No Azure provisioning, production migration, or rollout has been performed for the current-main port.
-
 ## Execution tracking and evidence
 
 Every phase should produce a short evidence record containing:
@@ -1332,7 +1298,7 @@ The storage abstraction document is now the project notebook for this work. Main
 - source paths and owner boundaries;
 - migrations and compatibility notes;
 - test commands and results;
-- live Azure SQL proof and known gaps;
+- sanitized Azure SQL proof and known gaps;
 - implementation follow-ups and rollback notes.
 
 Notebook entries must distinguish **approved**, **implemented**, **observed**, **blocked**, and **proposed** facts. Never present an unverified Azure SQL behavior, driver contract, timing claim, or migration result as completed proof.
@@ -1349,217 +1315,58 @@ The implementation may proceed autonomously through discovery, design refinement
 
 ## Execution status
 
-**Status:** Phase 0 decisions approved; dependency preflight complete; implementation is starting with the first vertical slice.
+**Status:** Phase 0 decisions are approved. The project-registry vertical slice is implemented for local review, with SQLite remaining the default backend.
 
-**Next action:** implement the backend-neutral project registry contract and preserve the SQLite path behind it before adding the Azure SQL runtime dependency. Scope is limited to code and local tests; no Azure resource provisioning or rollout is authorized.
+Implemented surfaces:
 
-## Preflight evidence: Azure SQL dependency and first slice
+- `src/storage/project-registry-store.ts` defines the backend-neutral project contract.
+- `src/storage/sqlite/project-registry-store.ts` preserves the existing SQLite behavior.
+- `src/storage/azure-sql/runtime.ts` owns pooled Azure SQL queries and transactions.
+- `src/storage/azure-sql/migrations.ts` owns locked, checksummed Azure SQL migrations.
+- `src/storage/azure-sql/project-registry-store.ts` implements project rows and checkout leases.
+- `src/storage/project-registry-store-factory.ts` selects and retains the process-stable backend owner.
+- `src/storage/migrations/project-registry.ts` provides the stopped-writer first-slice copy contract.
 
-**Status:** observed/recommended; no live Azure proof.
+The Azure SQL schema uses explicit binary collation and fixed-size hashes for long path and URL lookup keys. Lease expiry is computed by Azure SQL; process-local lease deadlines are conservative and cannot outlive the database lease. Secret-backed authentication is resolved at the runtime boundary, and SQL passwords must be configured through `SecretRef`.
 
-The repository currently has `kysely` and `sqlite-vec`, but no root `mssql` or `tedious` dependency. `@azure/identity` exists in an extension dependency surface, but it is not yet a core storage dependency. The candidate published packages and upstream source were inspected by the implementation session:
+Local tests cover configuration validation, credential resolution, pool and transaction behavior, migration locking and drift, SQLite compatibility, Azure project operations, checkout leases, first-slice migration conflicts, Gateway project flows, worktree authorization, setup preservation, and shutdown cleanup.
 
-- `mssql` provides the application-facing pool, request, transaction, timeout, and cancellation APIs.
-- Tedious provides the Azure SQL connection layer and token-credential authentication contract.
-- `@azure/identity` provides the Entra credential contract, including local developer credentials and managed identity.
+## Dependency preflight
 
-The recommended stack is `mssql` over Tedious with `@azure/identity`, subject to a local integration/type smoke test for token-credential forwarding before dependency landing. No authenticated Azure SQL connection, live transaction, or token-refresh test has been run or is authorized in this code-only task.
+The selected stack is:
 
-The first vertical slice is the **project registry** because it has a bounded table and clear owner, but still exercises duplicate detection, transactions, project identity, and the existing shared-state lifecycle lease. The current owner is `src/projects/project-registry.ts`. The initial adapter work must preserve SQLite behavior and keep project checkout lifecycle semantics unchanged.
+- `mssql` for application-facing pools, requests, transactions, timeout, and cancellation.
+- Tedious as the Azure SQL transport used by `mssql`.
+- `@azure/identity` for Entra token credentials.
 
-### Implementation progress: project registry contract
+The implementation keeps driver types inside the Azure SQL backend. No Azure resource provisioning, production migration, backend activation, or rollout is authorized by this design record. Live integration proof must use an explicitly isolated test resource and be recorded in sanitized form.
 
-**Status:** implemented locally, validation pending.
+## Current boundaries
 
-Added:
+This remains a first vertical slice:
 
-- `src/storage/project-registry-store.ts` — backend-neutral stored-record, lease, mutation-result, and repository contracts.
-- `src/storage/sqlite/project-registry-store.ts` — SQLite adapter owning project-table DDL, Kysely queries, duplicate detection, ID allocation, checkout-reference removal, and transactional lease assertions.
-- `src/projects/project-registry.ts` — project service now consumes the SQLite repository adapter instead of importing SQLite/Kysely directly.
+- Only the project registry and its checkout lease are implemented for Azure SQL.
+- Sessions, transcripts, memory, cron, audit, task, delivery, and other stores remain with their existing SQLite owners.
+- Backend-aware Doctor, backup, status, and the complete offline migration command remain pending.
+- Backend selection must not imply that stores outside the migrated slice have moved.
+- SQLite remains the supported default and regression reference.
 
-The service read/removal APIs are now asynchronous so the eventual Azure SQL implementation can use network I/O without a synchronous compatibility shim. Production callers and project tests were updated to await those operations. The project checkout lifecycle lease remains the authority boundary; the SQLite adapter invokes its transaction assertion before project mutations.
+The next implementation step is to complete review and local validation of this slice, then choose the next bounded store according to the phase order above. Each later store must retain its current transaction, authority, retention, recovery, and operator-visible failure contracts.
 
-The full Azure SQL backend is not yet complete. The repository dependency install/test harness was initially incomplete (`tsx/esm` was unavailable), but the workspace dependencies were subsequently installed locally. No Azure resource or live service was accessed.
+## Sanitized live Azure SQL proof
 
-### Implementation progress: Azure SQL runtime foundation
+**Status:** observed against an operator-approved isolated test database.
 
-**Status:** implemented locally, live proof intentionally not run.
+The current Azure SQL runtime and project-registry adapter completed this real backend flow:
 
-Added:
+1. Open an encrypted SQL-authenticated connection from the Linux runtime.
+2. Run the health query.
+3. Verify project migrations v1 and v2 are applied.
+4. Acquire the backend-owned checkout lease.
+5. Insert a synthetic project through the repository contract.
+6. Read it by ID and through the ordered list operation.
+7. Remove it through the repository contract.
+8. Verify both the synthetic project and checkout lease are absent.
+9. Close the connection pool.
 
-- `src/storage/azure-sql/runtime.ts` — Linux-neutral async pool, query, transaction, shutdown, token-credential configuration, and redacted failure classification.
-- `src/storage/azure-sql/runtime.test.ts` — local fake-pool tests for encrypted token configuration, connection reuse, commit, rollback, authentication classification, and secret redaction.
-- Root dependencies `mssql`, `@azure/identity`, and `@types/mssql` at the preflighted versions.
-
-The runtime uses constructor-injected pool creation so all local tests avoid network access. The production factory uses the `mssql` Tedious adapter and `DefaultAzureCredential`; no credential endpoint or Azure SQL server was contacted. The runtime tests cover pool reuse, health probing, commit, rollback, authentication classification, cancellation/error handling, and secret redaction; 5 tests currently pass.
-
-### Implementation progress: Azure SQL project adapter and backend config shape
-
-**Status:** adapter and validation contracts implemented locally; runtime selection is explicit and migration ownership is implemented, while setup propagation remains pending.
-
-Added:
-
-- `src/storage/azure-sql/project-registry-store.ts` — Azure SQL project repository using parameterized queries, transactional duplicate detection, `UPDLOCK/HOLDLOCK` reads for insert/delete races, `OUTPUT INSERTED` identity return, and explicit logical table/index DDL.
-- `src/storage/azure-sql/project-registry-store.test.ts` — local fake-database contract tests for schema initialization, duplicate registration, transactional removal, and lease callbacks.
-- `src/config/zod-schema.storage.ts` — approved `sqlite`/`azuresql` selection shape with required Azure endpoint settings.
-- `src/config/types.openclaw.ts` and `src/config/zod-schema.root-shape.ts` — typed/root schema exposure for the storage configuration.
-- `src/config/zod-schema.storage.test.ts` — local config validation tests.
-- `src/storage/storage-backend.ts` — backend kind resolution with SQLite as the default and explicit Azure configuration validation.
-
-Added:
-
-- `src/storage/project-registry-store-factory.ts` — explicit SQLite/Azure SQL repository selection, SQLite-default behavior, process-stable Azure database pooling, and controlled pool shutdown.
-
-Project registry callers now resolve through the backend factory. Existing calls without `storage.backend` continue to select SQLite. Azure selection requires explicit endpoint configuration; a configured unresolved SecretRef is rejected rather than ignored. Current setup/runtime callers do not yet pass Azure configuration, so no existing user path can accidentally switch backends. Credential-reference resolution is provided through an injected runtime SecretRef resolver; a configured credential without that resolver fails closed. Project checkout lease ownership now belongs to the selected project-store adapter, so an eventual Azure-enabled path will not cast an Azure transaction into the SQLite lease implementation. The first versioned migration owner is now present:
-
-- `src/storage/azure-sql/migrations.ts` — transaction-scoped `sp_getapplock` migration lock, migration table bootstrap, ordered migration application, SHA-256 drift detection, and idempotent retry.
-
-`AzureSqlProjectRegistryStore` now initializes its table through migration `global.projects.v1` rather than unversioned first-use DDL. The migration also owns the Azure project checkout-lease table. SQLite and Azure adapters both implement `withCheckoutLease`, preserving the lease owner boundary without making the Azure path depend on SQLite transactions. `src/storage/azure-sql/credentials.ts` adapts injected SecretRef resolution to the Azure token-credential contract, with local refresh and empty-token tests. Local migration and project-adapter tests pass: 4 tests passed together. No Azure service was contacted.
-
-The focused SQLite project-registry suite passes after the factory integration: 24 tests passed. The Azure adapter suite passes locally: 2 tests passed. The runtime/config suite passes locally: 6 runtime tests and 3 config tests passed. On the current-main port these earlier local-install gaps are closed: the gateway project sibling suite and the full configure-wizard suite now run on a complete current-main install with no missing markdown dependencies and no wizard timeout, so the prior validation gap no longer applies. No Azure resource or live service was accessed for the current-main validation.
-
-**Platform requirement:** the Azure SQL implementation must be supported on Linux as a first-class target, not only Windows. The adapter must avoid Windows-only path, process, credential, TLS, or filesystem assumptions. Local tests should run on Linux and cover platform-neutral behavior; any platform-specific driver behavior must be isolated and documented.
-
-## Current implementation status
-
-**Current-main port:** the storage abstraction first slice and its supporting setup/config, SecretRef, migration, and lifecycle cleanup wiring are ported to current `origin/main` (SHA `61d957a9cb64bd8c70cc125e644778b3fb034c49`) and validated there. The port is implemented and validated but currently uncommitted on top of that SHA.
-
-- **Project registry:** implemented and validated on current main.
-- **Azure SQL runtime:** locally tested and previously live-proven through the recorded isolated Azure SQL POC against `claw1`.
-- **Azure SQL project adapter:** first vertical slice implemented and validated; setup/config, SecretRef resolution, migration, and lifecycle cleanup are wired. Azure SQL adapters for the remaining operational stores remain pending.
-
-**Completed locally:**
-
-- Backend-neutral project registry contract.
-- SQLite project adapter with preserved lifecycle semantics.
-- Azure SQL runtime foundation using `mssql`/Tedious and Entra credentials.
-- Linux-neutral pool/query/transaction/health/error handling.
-- Azure SQL project repository with parameterized SQL and transactional lease ownership.
-- Azure SQL migration runner with migration locking and checksum drift detection.
-- Explicit SQLite/Azure project-store factory.
-- SecretRef-to-token-credential injection boundary.
-- Storage config schema and interactive configure wizard section.
-- First-slice project registry dry-run/execute migration helper.
-- Local unit/contract tests for all of the above.
-
-**Still in progress:**
-
-- Propagating backend selection to every storage owner.
-- General offline migration command and complete global/agent copy order.
-- Backend-aware Doctor, backup, status, and outage reporting.
-- Azure SQL adapters for remaining operational stores.
-- Session/transcript and memory/search backend contracts.
-- Full local contract/concurrency/performance/security sweep.
-
-No Azure provisioning, production migration, or rollout has been performed.
-
-### Azure SQL live connectivity attempt
-
-**Status:** network verified; interactive user authentication blocked by tenant Conditional Access.
-
-For `luistest1.database.windows.net:1433`, database `claw1`:
-
-- DNS resolved to the Azure SQL Australia East gateway.
-- TCP port 1433 was reachable from WSL/Linux.
-- A direct TDS login probe reached Azure SQL and returned `ELOGIN` with the server policy that Entra-only authentication is enabled.
-- Device-code authentication reached Microsoft sign-in, but the tenant refused token issuance because the requesting WSL/Linux device context was not recognized as a Microsoft-managed/compliant device.
-
-This is not an Azure SQL network or driver failure. It is a Conditional Access device-compliance gate on interactive user authentication. The Linux production path should use workload identity or managed identity. A local Linux end-to-end test requires either an approved workload identity/service principal, a short-lived token obtained through an approved managed-device broker flow, or an explicitly temporary SQL principal.
-
-A temporary contained SQL principal was subsequently used from the local Linux runtime without persisting or logging its password. Direct `mssql` authentication and `SELECT 1` succeeded, proving Linux-to-Azure SQL authentication and query execution. After the experiment principal received the approved temporary DDL/schema permissions, the real `AzureSqlDatabase` plus `AzureSqlProjectRegistryStore` successfully applied migration `global.projects.v1` in `claw1`.
-
-A standalone OpenClaw storage POC then exercised the real Azure SQL adapter end to end against `claw1`: health check, migration verification, backend checkout lease, project insert, point read, list visibility, delete, and post-delete cleanup verification all passed. The synthetic POC row was deleted before the connection closed. Observed result:
-
-```json
-{
-  "status": "passed",
-  "backend": "azuresql",
-  "database": "claw1",
-  "created": true,
-  "read": true,
-  "listed": true,
-  "removed": true,
-  "cleanupVerified": true
-}
-```
-
-The password was read from the operator-owned local credential file for the process only and was not copied into OpenClaw configuration, logs, or notebook evidence.
-
-### Interactive hybrid Gateway POC
-
-**Status:** running locally.
-
-An isolated Gateway is running on `ws://127.0.0.1:28792` with explicit Azure SQL storage configuration. The password is resolved through an OpenClaw file SecretRef copied into the isolated state credential directory with mode `0600`; it is not stored inline in `openclaw.json`. The Gateway reached ready state, and a real `projects.list` Gateway RPC succeeded after querying the Azure SQL project repository.
-
-A separate OpenClaw TUI window is connected to the Gateway for interactive questions. The first turn exposed an isolated-build packaging defect: `docs/reference/templates/AGENTS.md` had been omitted from the copied build inputs, so workspace bootstrap failed visibly with `Missing workspace template`. The canonical packaged template directory was copied into the isolated runtime; failed template loads are not retained in the runtime cache, so a newly opened TUI can retry without restarting the Gateway.
-
-This remains a **hybrid first-slice POC**:
-
-- Azure SQL owns the project registry and its checkout-lease/migration tables.
-- Chat sessions, transcripts, memory, cron, audit, and other stores still use the isolated local SQLite databases.
-- The TUI therefore proves normal Gateway/agent interaction alongside the Azure-backed project slice; it does not prove that chat content is persisted in Azure SQL yet.
-
-### Operator-selected model configuration
-
-**Status:** running; interactive turn confirmation pending operator input.
-
-The isolated Gateway and TUI were stopped, then restarted after applying the operator-provided endpoint, API key, and model from a local credential file. The source credential file was parsed without printing values. The API key was copied into the isolated state credential directory with mode `0600` and referenced through an OpenClaw file SecretRef; it was not written inline to `openclaw.json`. The endpoint uses HTTPS. Redacted config inspection confirms the selected primary provider is the configured POC provider without publishing the endpoint or model identifier.
-
-The hybrid Gateway is ready again on port `28792`. The operator requested a headless end-to-end proof rather than a TUI flow, so the interactive client was stopped and the proof was run through the one-shot Gateway agent command.
-
-The first provider request exposed that the supplied endpoint was a service root rather than a `/v1` base. A redacted direct protocol probe proved the compatible shape: bearer authentication, `/v1/chat/completions`, and `max_completion_tokens`. The isolated configuration was corrected without publishing the endpoint or model identifier.
-
-The final end-to-end turn passed:
-
-- CLI submitted a synthetic message to the live Gateway.
-- Gateway admitted the turn and invoked the configured provider/model.
-- The provider returned the exact expected synthetic response.
-- CLI exited `0` with status `ok` and no error.
-- The Azure-backed `projects.list` RPC still succeeded after the turn.
-- Local agent SQLite contains one matching session row and ten transcript events, confirming the documented hybrid persistence boundary.
-
-As before, chat/session persistence remains SQLite while the project registry remains Azure SQL. API keys and database passwords were resolved from isolated mode-`0600` credential files and were not written inline or included in proof output.
-
-The operator independently completed the Gateway-level Azure SQL persistence check: created a temporary committed Git checkout, registered it through `projects.register`, observed it through `projects.list`, confirmed the row in `openclaw_global.projects`, and reported success. The provided cleanup path removes the registry row through `projects.remove` and deletes the temporary checkout.
-
-## Live SQLite smoke evidence
-
-**Status:** observed locally.
-
-The current source was copied into an isolated WSL Linux filesystem checkout, built there, and started in a separate Windows Terminal window with:
-
-```text
-storage.backend = sqlite
-gateway.mode = local
-bind = loopback
-port = 28791
-state directory = ~/.cache/openclaw-storage-live-state
-```
-
-The operator's normal Gateway and state directory were not touched. Observed evidence:
-
-- Gateway bound `127.0.0.1:28791` and `[::1]:28791`.
-- Gateway startup reached `[gateway] ready`.
-- `GET http://127.0.0.1:28791/health` returned `{"ok":true,"status":"live"}`.
-- `openclaw config get storage.backend` returned `sqlite`.
-- The isolated state database exists at `state/openclaw.sqlite` under the isolated state directory.
-- Direct read-only metadata inspection returned `{"role":"global","schema_version":15}`.
-
-The successful launch required an isolated Linux-filesystem build because fs-safe build locking cannot publish correctly on this checkout's WSL-mounted Windows filesystem. It also required a complete workspace install and a runtime-oriented build sequence to stay within local memory limits. Control UI asset generation failed during startup, but the Gateway HTTP server and storage backend reached ready state; this does not affect the SQLite persistence proof.
-
-`src/storage/project-registry-store-factory.test.ts` now proves SQLite-default selection, explicit Azure selection without connecting, and fail-closed unresolved credentials. The selected backend is propagated through the project-registry options used by the project Gateway methods when an explicit `storage` configuration is present. SQLite remains the default when it is omitted. Broader setup/runtime propagation remains a controlled next step because other stores still use their current SQLite owners.
-
-### Setup-time selection implementation
-
-Added the `storage` configure section to the interactive configuration surface:
-
-- `src/commands/configure.shared.ts` exposes `storage` as a selectable section.
-- `src/commands/configure.wizard.ts` prompts for SQLite or Azure SQL and, for Azure SQL, the server and database endpoint.
-- The wizard writes the backend selection through the existing config transaction; it does not collect raw passwords.
-- `src/commands/configure.commands.test.ts` passes with the expanded section list.
-
-The wizard does not contact Azure SQL in this local-only implementation. Connection/permission probing remains a runtime/Doctor operation and must be explicitly invoked by the operator.
-
-### Offline migration implementation: first slice
-
-Added `src/storage/migrations/project-registry.ts`, which provides a stopped-writer-gated dry-run/execute migration for the canonical project registry contract. It preserves stable project IDs, skips already existing canonical roots, acquires the target backend's checkout lease before writes, and leaves the source untouched. Local migration tests cover dry-run/no-write behavior, existing rows, source-stop gating, stable IDs, and target writes: 2 tests passed.
+Every step passed. The synthetic identifiers and records were removed. The connection target, username, and password were read only by the test process and were not written to configuration, logs, or this document. This proves the Azure SQL project-registry vertical slice; it does not extend Azure SQL coverage to stores listed under [Current boundaries](#current-boundaries).

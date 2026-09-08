@@ -15,17 +15,44 @@ describe("createProjectRegistryStore", () => {
     expect(store).not.toBeInstanceOf(AzureSqlProjectRegistryStore);
   });
 
-  it("selects Azure SQL only for explicit complete configuration", () => {
-    const store = createProjectRegistryStore({
+  it("selects and reuses Azure SQL only for explicit complete configuration", () => {
+    const options = {
       storage: {
-        backend: "azuresql",
+        backend: "azuresql" as const,
         azureSql: {
           server: "sql.example.invalid",
           database: "openclaw",
         },
       },
-    });
+    };
+    const store = createProjectRegistryStore(options);
     expect(store).toBeInstanceOf(AzureSqlProjectRegistryStore);
+    expect(createProjectRegistryStore(options)).toBe(store);
+  });
+
+  it("replaces the cached SQL-password store when the resolved password rotates", () => {
+    const storage = {
+      backend: "azuresql" as const,
+      azureSql: {
+        server: "sql.example.invalid",
+        database: "openclaw",
+        authentication: {
+          mode: "sql-password" as const,
+          username: "openclaw",
+          password: { source: "env" as const, provider: "default", id: "AZURE_SQL_PASSWORD" },
+        },
+      },
+    };
+    const first = createProjectRegistryStore({
+      storage,
+      azureSqlPassword: { username: "openclaw", password: "first-password" },
+    });
+    const rotated = createProjectRegistryStore({
+      storage,
+      azureSqlPassword: { username: "openclaw", password: "rotated-password" },
+    });
+
+    expect(rotated).not.toBe(first);
   });
 
   it("rejects unresolved configured credentials before opening a pool", () => {

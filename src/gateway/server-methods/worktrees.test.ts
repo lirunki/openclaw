@@ -11,10 +11,28 @@ import { registerProjectRegistry, removeProjectRegistry } from "../../projects/p
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { createWorktreesHandlers } from "./worktrees.js";
 
+const projectRegistryMocks = vi.hoisted(() => ({
+  resolveRecordedProjectRoot: vi.fn(),
+}));
+
+vi.mock("../../projects/project-registry.js", async () => {
+  const actual = await vi.importActual<typeof import("../../projects/project-registry.js")>(
+    "../../projects/project-registry.js",
+  );
+  projectRegistryMocks.resolveRecordedProjectRoot.mockImplementation(
+    actual.resolveRecordedProjectRoot,
+  );
+  return {
+    ...actual,
+    resolveRecordedProjectRoot: projectRegistryMocks.resolveRecordedProjectRoot,
+  };
+});
+
 const execFileAsync = promisify(execFile);
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => {
+  projectRegistryMocks.resolveRecordedProjectRoot.mockClear();
   closeOpenClawStateDatabaseForTest();
 });
 
@@ -242,6 +260,39 @@ describe("worktrees gateway methods", () => {
     } finally {
       await removeProjectRegistry(project.id);
     }
+  });
+
+  it("authorizes registered roots through the configured storage backend", async () => {
+    const repoRoot = "/azure-backed/project";
+    projectRegistryMocks.resolveRecordedProjectRoot.mockResolvedValueOnce(repoRoot);
+    const service = {
+      listRepositoryBranches: vi.fn(async () => ({ branches: [] })),
+    };
+    const handlers = createWorktreesHandlers(service as never);
+    const storage = {
+      backend: "azuresql" as const,
+      azureSql: {
+        server: "sql.example.invalid",
+        database: "openclaw",
+        credential: { source: "env" as const, provider: "default", id: "AZURE_SQL_TOKEN" },
+      },
+    };
+
+    const response = await call(
+      handlers,
+      "worktrees.branches",
+      { repoRoot },
+      {
+        client: writeClient,
+        context: { getRuntimeConfig: () => ({ storage }) },
+      },
+    );
+
+    expect(response?.[0]).toBe(true);
+    expect(projectRegistryMocks.resolveRecordedProjectRoot).toHaveBeenCalledWith(
+      repoRoot,
+      expect.objectContaining({ storage, azureSqlSecretResolver: expect.any(Function) }),
+    );
   });
 
   it("uses the built-in cleanup policy for gc", async () => {
