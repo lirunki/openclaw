@@ -6,15 +6,16 @@ import type {
 import { createContractToolTerminalObserver } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
 import { AuthStorage, ModelRegistry } from "openclaw/plugin-sdk/agent-sessions";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import { createAdmittedHostCapabilityTestFixture } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
+import {
+  createAdmittedHostCapabilityTestFixture,
+  replaceSessionEntrySync,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
 import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
-import { expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { createCopilotAgentHarness } from "../harness.js";
 import { createCopilotFaultPeer } from "./catalog-lifetime.test-support.js";
 import { createCopilotClientPool } from "./runtime.js";
 import { createCopilotToolBridge } from "./tool-bridge.js";
-import * as toolBridgeModule from "./tool-bridge.js";
 
 it("cancels a resumed Code Mode cell during real SDK session.error cleanup before host closure", async () => {
   const state = await createOpenClawTestState({ label: "copilot-catalog-lifetime" });
@@ -34,7 +35,7 @@ it("cancels a resumed Code Mode cell during real SDK session.error cleanup befor
   >;
   let catalog: ToolOptions["toolSearchCatalogRef"];
   let contextSignal: AbortSignal | undefined;
-  let retained: AnyAgentTool[] = [];
+  let retainedTool: AnyAgentTool | undefined;
   const fixtureTool: AnyAgentTool = {
     name: "fixture_gate",
     label: "Fixture gate",
@@ -57,9 +58,12 @@ it("cancels a resumed Code Mode cell during real SDK session.error cleanup befor
   const sessionId = "catalog-lifetime-session";
   const sessionKey = "agent:main:catalog-lifetime";
   const runId = "catalog-lifetime-run";
+  const lifecycleRevision = "catalog-lifetime-lifecycle";
   const providerFailure = "deterministic non-timeout provider failure";
   const target = {
     agentId: "main",
+    expectedLifecycleRevision: lifecycleRevision,
+    expectedWriterRunId: runId,
     sessionId,
     sessionKey,
     storePath: path.join(state.sessionsDir(), "sessions.json"),
@@ -91,34 +95,51 @@ it("cancels a resumed Code Mode cell during real SDK session.error cleanup befor
     persistFallback: async () => {},
   };
   const config = { tools: { codeMode: { enabled: true } } };
-  const host = await createAdmittedHostCapabilityTestFixture({
-    config,
-    runId,
-    agentId: "main",
-    sessionId,
-    sessionKey,
-    workspaceDir: state.workspaceDir,
-    abortSignal: callController.signal,
-  });
+  const host = await createAdmittedHostCapabilityTestFixture(
+    {
+      config,
+      runId,
+      agentId: "main",
+      sessionId,
+      sessionKey,
+      workspaceDir: state.workspaceDir,
+      abortSignal: callController.signal,
+    },
+    {
+      transcriptTarget: target,
+    },
+  );
   let attempt: ReturnType<typeof harness.runAttempt> | undefined;
-  const realCreateToolBridge = createCopilotToolBridge;
-  const constructBridge = vi
-    .spyOn(toolBridgeModule, "createCopilotToolBridge")
-    .mockImplementation(async (input) => {
-      const bridge = await realCreateToolBridge({
-        ...input,
-        createOpenClawCodingTools: (options) => {
-          catalog = options?.toolSearchCatalogRef;
-          contextSignal = options?.abortSignal;
-          return [fixtureTool];
-        },
-      });
-      retained = bridge.sourceTools;
-      return bridge;
-    });
   try {
+    const createToolSurface = host.hostCapabilities.createToolSurface;
+    if (!createToolSurface) {
+      throw new Error("Expected the admitted modern host tool constructor");
+    }
+    const hostCapabilities = Object.freeze({
+      ...host.hostCapabilities,
+      createToolSurface: (...args: Parameters<typeof createToolSurface>) => {
+        const [options, bindingOptions] = args;
+        catalog = options.toolSearchCatalogRef;
+        contextSignal = options.abortSignal;
+        const tools = createToolSurface(...args);
+        const [boundFixtureTool] = host.hostCapabilities.bindToolSurface(
+          [fixtureTool],
+          bindingOptions,
+        );
+        if (!boundFixtureTool) {
+          throw new Error("Expected the admitted host to bind the fixture tool");
+        }
+        retainedTool = boundFixtureTool;
+        return [...tools, boundFixtureTool];
+      },
+    });
     await state.writeConfig(config);
-    await upsertSessionEntry({ ...target, entry: { sessionId, updatedAt: Date.now() } });
+    replaceSessionEntrySync(target, {
+      activeWriterRunId: runId,
+      lifecycleRevision,
+      sessionId,
+      updatedAt: Date.now(),
+    });
     const authStorage = AuthStorage.inMemory();
     const params = {
       agentId: "main",
@@ -130,7 +151,7 @@ it("cancels a resumed Code Mode cell during real SDK session.error cleanup befor
       sessionFile: path.join(state.sessionsDir(), "catalog-lifetime.jsonl"),
       runId,
       config,
-      hostCapabilities: host.hostCapabilities,
+      hostCapabilities,
       auth: { useLoggedInUser: true },
       provider: "github-copilot",
       modelId: "auto",
@@ -164,9 +185,13 @@ it("cancels a resumed Code Mode cell during real SDK session.error cleanup befor
       host.closeAdmission();
     });
     await peer.sent;
-    const execReply = peer.requestTool("exec", {
-      code: 'await yield_control(); await fixture_gate({}); text("STALE AFTER CLOSE"); return "stale";',
-    });
+    const execReply = peer.requestTool(
+      "exec",
+      {
+        code: 'await yield_control(); await fixture_gate({}); text("STALE AFTER CLOSE"); return "stale";',
+      },
+      { emitAssistantMessage: true },
+    );
     await execReply;
     const execResult = observed.find((event) => event.toolName === "exec")?.result as {
       details: { status: string; runId: string };
@@ -238,7 +263,6 @@ it("cancels a resumed Code Mode cell during real SDK session.error cleanup befor
       outerAborted: callController.signal.aborted,
     };
     expect(() => host.hostCapabilities.assertActive()).toThrow(/no longer active/);
-    const retainedTool = retained.at(0);
     if (!retainedTool) {
       throw new Error("Expected a retained host-bound tool");
     }
@@ -277,7 +301,6 @@ it("cancels a resumed Code Mode cell during real SDK session.error cleanup befor
     await attempt;
     host.closeHost();
     host.closeAdmission();
-    constructBridge.mockRestore();
     await harness.dispose?.();
     await pool.dispose();
     await peer.close();

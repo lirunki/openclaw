@@ -75,6 +75,10 @@ import {
   bindActiveCronCreatorAuthorityResolver,
   bindCronManagementGrant,
 } from "./cron-creator-authority-context.js";
+import {
+  type CurrentTurnDeliveryConstruction,
+  rebindCurrentTurnDeliveryToolRef,
+} from "./current-turn-delivery.js";
 import { applyDelegationCapability, type DelegationCapability } from "./delegation-capability.js";
 import { pinExecToolTarget } from "./exec-tool-target-pinning.js";
 import { prepareGitHubToolEnvironment } from "./github-tool-identity.js";
@@ -414,7 +418,16 @@ type OpenClawCodingToolsOptions = {
   scheduledToolPolicy?: ScheduledToolPolicyContext;
 };
 
-function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions): AnyAgentTool[] {
+/** Core-only construction; the public harness builder never supplies the delivery slot. */
+export function createEmbeddedAttemptCodingTools(
+  options?: OpenClawCodingToolsOptions,
+  currentTurnDelivery?: CurrentTurnDeliveryConstruction,
+): AnyAgentTool[] {
+  const currentTurnDeliveryToolRef = currentTurnDelivery?.toolRef;
+  const includeCurrentTurnDeliveryTool = currentTurnDeliveryToolRef !== undefined;
+  const createOpenClawToolsForCurrentTurn = (
+    toolOptions: Parameters<typeof createOpenClawTools>[0],
+  ) => createOpenClawTools(toolOptions, currentTurnDelivery);
   const sandbox = options?.sandbox?.enabled ? options.sandbox : undefined;
   const isMemoryFlushRun = options?.trigger === "memory";
   if (isMemoryFlushRun && !options?.memoryFlushWritePath) {
@@ -775,8 +788,11 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
           turnSourceThreadId: options.currentThreadTs ?? options.messageThreadId,
         }
       : undefined;
+  if (currentTurnDeliveryToolRef) {
+    delete currentTurnDeliveryToolRef.value;
+  }
   const pluginToolsOnly = filterToolsByClientCaps(
-    includeOpenClawTools || !includePluginTools
+    includeOpenClawTools || (!includePluginTools && !includeCurrentTurnDeliveryTool)
       ? []
       : resolveOpenClawPluginToolsForOptions({
           options: {
@@ -820,8 +836,10 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
             clientCaps: options?.clientCaps,
             toolBindings: options?.toolBindings,
             authProfileStore: options?.authProfileStore,
+            disablePluginTools: !includePluginTools,
           },
           resolvedConfig: options?.config,
+          currentTurnDelivery,
         }),
     options?.clientCaps,
   );
@@ -855,7 +873,7 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
     ...(includeOpenClawTools
       ? mergeAgentRingZeroTools(
           ringZeroTools,
-          createOpenClawTools({
+          createOpenClawToolsForCurrentTurn({
             ...(options?.systemAgentTool ? { systemAgentTool: options.systemAgentTool } : {}),
             sandboxBrowserBridgeUrl: sandbox?.browser?.bridgeUrl,
             allowHostBrowserControl: sandbox ? sandbox.browserAllowHostControl : true,
@@ -1050,10 +1068,17 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
       toolDenylist: pluginToolDenylist,
     }),
   });
-  // Host-bound ring-zero tools carry their own authority checks. Agent policy
-  // must not deadlock setup, but the tools still receive schema/hook wrappers.
+  const currentTurnDeliveryTool =
+    currentTurnDeliveryToolRef?.value && tools.includes(currentTurnDeliveryToolRef.value)
+      ? currentTurnDeliveryToolRef.value
+      : undefined;
+  const hostBoundTools = currentTurnDeliveryTool
+    ? [...ringZeroTools, currentTurnDeliveryTool]
+    : ringZeroTools;
+  // The exact host-created capability survives operator policy. Public-name
+  // collisions remain ordinary plugin tools and cannot enter this set.
   const authorizedTools = applyDelegationCapability(
-    mergeAgentRingZeroTools(ringZeroTools, subagentFiltered),
+    mergeAgentRingZeroTools(hostBoundTools, subagentFiltered),
     options?.delegationCapability,
   ).filter(
     (tool) =>
@@ -1115,7 +1140,7 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
     allocateToolOutcomeOrdinal: options?.allocateToolOutcomeOrdinal,
   };
   // NOTE: Keep canonical (lowercase) tool names here. Provider transports remap on the wire.
-  return finalizeAgentTools({
+  const finalizedTools = finalizeAgentTools({
     tools: authorizedTools,
     modelProvider: options?.modelProvider,
     modelId: options?.modelId,
@@ -1127,10 +1152,12 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
     abortSignal: options?.abortSignal,
     recordToolPrepStage: options?.recordToolPrepStage,
   }).map((tool) => wrapToolWithGatewayCallerIdentity(tool, toolCallerIdentity));
+  rebindCurrentTurnDeliveryToolRef(currentTurnDeliveryToolRef, authorizedTools, finalizedTools);
+  return finalizedTools;
 }
 
 /** Build the runtime tool list exposed through the public agent harness SDK. */
 export function createOpenClawCodingTools(options?: OpenClawCodingToolsOptions): AnyAgentTool[] {
-  return createOpenClawCodingToolsInternal(options);
+  return createEmbeddedAttemptCodingTools(options);
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

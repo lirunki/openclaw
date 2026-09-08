@@ -118,6 +118,24 @@ const ttsProvenanceTransferCapabilities = new WeakMap<
   AgentHarnessHostCapabilities,
   Readonly<{ ownerPluginId: string; transfer: AgentHarnessTtsProvenanceTransfer }>
 >();
+const currentTurnDeliveryTools = new WeakMap<readonly AnyAgentTool[], AnyAgentTool>();
+
+/** Records the exact host-bound delivery tool for one constructed tool surface. */
+export function registerAgentHarnessCurrentTurnDeliveryTool(
+  tools: readonly AnyAgentTool[],
+  tool: AnyAgentTool | undefined,
+): void {
+  if (tool) {
+    currentTurnDeliveryTools.set(tools, tool);
+  }
+}
+
+/** Resolves only the host-bound delivery instance carried by this exact surface. */
+export function resolveAgentHarnessCurrentTurnDeliveryTool(
+  tools: readonly AnyAgentTool[],
+): AnyAgentTool | undefined {
+  return currentTurnDeliveryTools.get(tools);
+}
 
 export function registerAgentHarnessScheduledToolProjectionCapability(params: {
   hostCapabilities: AgentHarnessHostCapabilities;

@@ -1,8 +1,10 @@
 import type { SessionPermissionMode } from "../../../../packages/gateway-protocol/src/schema/sessions-row.js";
+import type { SessionWriterDeliveryAuthority } from "../../../auto-reply/reply-payload.js";
 /**
  * Prepares the core tool surface for one embedded attempt.
  * It may assume workspace, model, and runtime policy inputs are resolved.
  */
+import { assertSessionWriterDeliveryAuthorized } from "../../../auto-reply/reply/session-writer-delivery-authority.js";
 import { messageToolOwnsVisibleReply } from "../../../auto-reply/source-reply-delivery-mode.js";
 import type { DiagnosticTraceContext } from "../../../infra/diagnostic-trace-context.js";
 import {
@@ -14,7 +16,7 @@ import { extractModelCompat } from "../../../plugins/provider-model-compat.js";
 import { getPluginToolMeta } from "../../../plugins/tool-metadata.js";
 import { isSubagentSessionKey } from "../../../routing/session-key.js";
 import type { NestedToolActivity } from "../../../sessions/nested-tool-activity.js";
-import { createOpenClawCodingTools } from "../../agent-tools.js";
+import { createEmbeddedAttemptCodingTools } from "../../agent-tools.js";
 import { createSkillInstructionDeliveryCache } from "../../agent-tools.read.js";
 import { getChannelAgentToolMeta } from "../../channel-tools.js";
 import { createCodeModePermissionChangeReason } from "../../code-mode-permission-change.js";
@@ -24,6 +26,10 @@ import {
   CodeModeTranscriptAuthority,
 } from "../../code-mode-transcript-authority.js";
 import { resolveConversationCapabilityProfile } from "../../conversation-capability-profile.js";
+import {
+  rebindCurrentTurnDeliveryToolRef,
+  type CurrentTurnDeliveryToolRef,
+} from "../../current-turn-delivery.js";
 import {
   isLocalModelLeanEnabled,
   resolveLocalModelLeanPreserveToolNames,
@@ -59,7 +65,9 @@ import { buildEmbeddedAttemptToolRunContext } from "./attempt-tool-run-context.j
 import { TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES } from "./attempt-tool-search-run-plan.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
-type OpenClawCodingToolsOptions = NonNullable<Parameters<typeof createOpenClawCodingTools>[0]>;
+type OpenClawCodingToolsOptions = NonNullable<
+  Parameters<typeof createEmbeddedAttemptCodingTools>[0]
+>;
 type SkillUsagePaths = OpenClawCodingToolsOptions["skillUsagePaths"];
 
 export function prepareEmbeddedAttemptToolBase(params: {
@@ -154,13 +162,21 @@ export function prepareEmbeddedAttemptToolBase(params: {
   const inheritedToolAllowlist: string[] = [];
   const runCleanups: Array<(reason: string) => Promise<void>> = [];
   const transcriptTarget = attempt.sessionTarget;
-  if (
-    codeModeControlsEnabledForRun &&
+  const sessionWriterDeliveryAuthority: SessionWriterDeliveryAuthority | undefined =
     transcriptTarget?.sessionId &&
     transcriptTarget.sessionKey &&
     transcriptTarget.storePath &&
     transcriptTarget.expectedWriterRunId
-  ) {
+      ? {
+          agentId: transcriptTarget.agentId,
+          expectedLifecycleRevision: transcriptTarget.expectedLifecycleRevision,
+          expectedSessionId: transcriptTarget.sessionId,
+          expectedWriterRunId: transcriptTarget.expectedWriterRunId,
+          sessionKey: transcriptTarget.sessionKey,
+          storePath: transcriptTarget.storePath,
+        }
+      : undefined;
+  if (codeModeControlsEnabledForRun && sessionWriterDeliveryAuthority && transcriptTarget) {
     const authority = new CodeModeTranscriptAuthority({
       ...transcriptTarget,
       sessionId: transcriptTarget.sessionId,
@@ -259,10 +275,11 @@ export function prepareEmbeddedAttemptToolBase(params: {
     sessionPermissionPolicy: PreparedSessionPermissionPolicy | undefined,
     abortSignal: AbortSignal,
   ) => {
+    const currentTurnDeliveryToolRef: CurrentTurnDeliveryToolRef = {};
     const constructedToolsRaw = !shouldConstructTools
       ? []
       : (() => {
-          const allTools = createOpenClawCodingTools({
+          const toolOptions: OpenClawCodingToolsOptions = {
             agentId: params.setup.sessionAgentId,
             ...buildConversationContext(),
             exec: {
@@ -328,15 +345,32 @@ export function prepareEmbeddedAttemptToolBase(params: {
             skillUsagePaths: params.skillUsagePaths,
             conversationCapabilityProfile: runtimeCapabilityProfile,
             onYield: params.onYield,
-          });
+          };
+          const currentTurnDelivery = sessionWriterDeliveryAuthority
+            ? {
+                authority: {
+                  abortSignal,
+                  assertSessionWriterCurrent: () =>
+                    assertSessionWriterDeliveryAuthorized(sessionWriterDeliveryAuthority),
+                },
+                ...(codeModeControlsEnabledForRun && !attempt.forceRestartSafeTools
+                  ? { toolRef: currentTurnDeliveryToolRef }
+                  : {}),
+              }
+            : undefined;
+          const allTools = createEmbeddedAttemptCodingTools(toolOptions, currentTurnDelivery);
           // The built-in harness retains its existing authoritative wrappers.
           // Only plugin harnesses receive and require the projected host capability.
           const boundTools = attempt.hostCapabilities
             ? attempt.hostCapabilities.bindToolSurface(allTools)
             : allTools;
+          rebindCurrentTurnDeliveryToolRef(currentTurnDeliveryToolRef, allTools, boundTools);
           params.markCoreToolStage("attempt:create-openclaw-coding-tools");
           const filteredTools = applyEmbeddedAttemptToolsAllow(boundTools, effectiveToolsAllow, {
             toolMeta: (tool) => getPluginToolMeta(tool),
+            preserveTools: currentTurnDeliveryToolRef.value
+              ? new Set([currentTurnDeliveryToolRef.value])
+              : undefined,
           });
           params.markCoreToolStage("attempt:tools-allow");
           return filteredTools;
