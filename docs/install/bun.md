@@ -81,7 +81,10 @@ from Homebrew or MacPorts before opening a database, and uses the same library i
 the memory KNN child process. Discovery checks `$HOMEBREW_PREFIX/opt/sqlite/lib/libsqlite3.dylib`
 first, then the standard Homebrew paths under `/opt/homebrew` and `/usr/local`,
 then `/opt/local/lib/libsqlite3.dylib` for MacPorts. Linux and Windows Bun already
-support extension loading and need no additional SQLite installation.
+support extension loading and need no additional SQLite installation. Daemon
+install, `openclaw doctor`, and service audits probe candidate Bun executables
+through the same selection, so they judge and report the library the Gateway
+will actually open rather than the runtime's default SQLite.
 
 To override discovery, set `OPENCLAW_SQLITE_LIBRARY` in the process environment
 before starting OpenClaw:
@@ -92,8 +95,10 @@ OPENCLAW_SQLITE_LIBRARY=/path/to/libsqlite3.dylib bun openclaw.mjs gateway
 
 The override must point to a loadable SQLite library that meets the WAL safety
 floor and supports extension loading. An invalid override fails with an error
-explaining how to fix or unset it. Node and Bun on platforms other than macOS
-ignore this override; Gateway startup logs a warning when it is ignored.
+explaining how to fix or unset it, both at Gateway startup and when a daemon
+install or repair probes Bun from the same environment. Node and Bun on platforms
+other than macOS ignore this override; Gateway startup logs a warning when it is
+ignored.
 
 If you previously used a Bun preload script that calls `Database.setCustomSQLite()`,
 remove that preload and set `OPENCLAW_SQLITE_LIBRARY` to the same library path
