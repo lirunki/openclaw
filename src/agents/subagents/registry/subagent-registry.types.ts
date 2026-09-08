@@ -311,6 +311,8 @@ export type SubagentRunRecord = {
   queuedLaunch?: SwarmQueuedLaunch;
   /** Durable retry obligation for a prepared collector session whose launch failed. */
   collectorLaunchCleanupPending?: boolean;
+  /** A pre-dispatch rejection must not replace an already-terminal task projection on replay. */
+  taskTerminalProjection?: "preserve_existing";
   /** Set after failed-launch context-engine cleanup succeeds, preventing duplicate end hooks. */
   contextEngineCleanupCompletedAt?: number;
   collectorCompletion?: SwarmCollectorCompletion;

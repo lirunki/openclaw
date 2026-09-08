@@ -25,6 +25,8 @@ export function normalizeSubagentRunState(entry: SubagentRunRecord): SubagentRun
     ? entry.deleteCleanupDispatchedAt
     : undefined;
   entry.suppressCompletionDelivery = entry.suppressCompletionDelivery === true ? true : undefined;
+  entry.taskTerminalProjection =
+    entry.taskTerminalProjection === "preserve_existing" ? "preserve_existing" : undefined;
   entry.terminalOwner =
     entry.terminalOwner === "interrupted-recovery" &&
     Number.isFinite(entry.execution.endedAt) &&

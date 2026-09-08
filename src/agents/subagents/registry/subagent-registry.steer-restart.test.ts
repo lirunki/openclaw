@@ -585,6 +585,7 @@ describe("subagent registry steer restarts", () => {
       };
       previous.cleanupCompletedAt = Date.now();
       previous.cleanupHandled = true;
+      previous.taskTerminalProjection = "preserve_existing";
     }
 
     const run = expectDefined(
@@ -600,6 +601,7 @@ describe("subagent registry steer restarts", () => {
     expect(run.completion?.capturedAt).toBeUndefined();
     expect(run.cleanupCompletedAt).toBeUndefined();
     expect(run.cleanupHandled).toBe(false);
+    expect(run.taskTerminalProjection).toBeUndefined();
   });
 
   it("updates task to the dispatched steer message when provided", () => {

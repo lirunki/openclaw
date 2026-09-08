@@ -1,5 +1,6 @@
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { isTerminalTaskStatus } from "./task-executor-policy.js";
 import { getTaskFlowById } from "./task-flow-runtime-internal.js";
 import {
   ensureTaskRegistryReady,
@@ -16,6 +17,15 @@ export type TaskBackingInstance =
 
 type TaskBackingDetail = TaskBackingInstance & { kind: typeof TASK_BACKING_DETAIL_KIND };
 type ManagedTaskBacking = { taskId: string; instance: TaskBackingInstance };
+
+export type SubagentTaskBackingPolicy =
+  | "queued-dispatch"
+  | "gateway-acceptance"
+  | "failure-finalization";
+
+export type SubagentTaskBackingValidation =
+  | { ok: true; task: TaskRecord }
+  | { ok: false; reason: string };
 
 export function readTaskBackingInstance(value: unknown): TaskBackingInstance | undefined {
   const detail = asOptionalRecord(value);
@@ -55,6 +65,35 @@ function sameTaskBackingInstance(left: TaskBackingInstance, right: TaskBackingIn
     : left.runtime === "subagent" && right.runtime === "subagent"
       ? left.generation === right.generation
       : false;
+}
+
+export function isManagedTaskProjection(task: TaskRecord): boolean {
+  const flowId = task.parentFlowId?.trim();
+  return Boolean(flowId && getTaskFlowById(flowId)?.syncMode === "managed");
+}
+
+export function isAuthorizedManagedTaskProjection(params: {
+  task: TaskRecord;
+  canonical: TaskRecord;
+}): boolean {
+  const { task, canonical } = params;
+  const flowId = task.parentFlowId?.trim();
+  const managed =
+    flowId && getTaskFlowById(flowId)?.syncMode === "managed"
+      ? readManagedTaskBacking(task.detail)
+      : undefined;
+  const canonicalInstance = readTaskBackingInstance(canonical.detail);
+  return Boolean(
+    managed &&
+    canonicalInstance &&
+    task.runtime === canonical.runtime &&
+    task.scopeKind === canonical.scopeKind &&
+    task.ownerKey === canonical.ownerKey &&
+    task.childSessionKey?.trim() === canonical.childSessionKey?.trim() &&
+    task.runId?.trim() === canonical.runId?.trim() &&
+    managed.taskId === canonical.taskId &&
+    sameTaskBackingInstance(managed.instance, canonicalInstance),
+  );
 }
 
 function isCanonicalBackingTask(task: TaskRecord): boolean {
@@ -133,6 +172,54 @@ export function createNextAcpTaskBackingDetail(params: {
 
 export function createSubagentTaskBackingDetail(generation: number): TaskBackingDetail {
   return { kind: TASK_BACKING_DETAIL_KIND, runtime: "subagent", generation };
+}
+
+/** Validates the exact task row minted by one subagent owner generation. */
+export function validateSubagentTaskBacking(params: {
+  task: TaskRecord | undefined;
+  runId: string;
+  ownerKey: string;
+  childSessionKey: string;
+  generation: number | undefined;
+  policy: SubagentTaskBackingPolicy;
+  preserveTerminalState?: boolean;
+}): SubagentTaskBackingValidation {
+  const task = params.task;
+  if (!task) {
+    return { ok: false, reason: "is missing" };
+  }
+  if (isManagedTaskProjection(task)) {
+    return { ok: false, reason: "is not the canonical backing row" };
+  }
+  const backing = readTaskBackingInstance(task.detail);
+  if (
+    task.runtime !== "subagent" ||
+    task.runId?.trim() !== params.runId ||
+    task.ownerKey.trim() !== params.ownerKey ||
+    task.childSessionKey?.trim() !== params.childSessionKey
+  ) {
+    return { ok: false, reason: "does not match the registered owner" };
+  }
+  if (
+    !Number.isSafeInteger(params.generation) ||
+    (params.generation ?? 0) <= 0 ||
+    backing?.runtime !== "subagent" ||
+    backing.generation !== params.generation
+  ) {
+    return { ok: false, reason: "does not match the registered generation" };
+  }
+  if (params.policy === "queued-dispatch" && task.status !== "queued") {
+    return { ok: false, reason: `cannot dispatch from ${task.status} state` };
+  }
+  if (
+    params.policy === "gateway-acceptance" &&
+    task.status !== "queued" &&
+    task.status !== "running" &&
+    !(params.preserveTerminalState === true && isTerminalTaskStatus(task.status))
+  ) {
+    return { ok: false, reason: `cannot accept from ${task.status} state` };
+  }
+  return { ok: true, task };
 }
 
 export function resolveManagedTaskBackingDetail(params: {

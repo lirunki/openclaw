@@ -204,6 +204,7 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
       killReconciliation: undefined,
       killIntent: undefined,
       suppressCompletionDelivery: undefined,
+      taskTerminalProjection: undefined,
       delivery: {
         status: source.expectsCompletionMessage === false ? "not_required" : "pending",
       },

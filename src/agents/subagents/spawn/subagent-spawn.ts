@@ -19,6 +19,7 @@ import {
   recordSessionCreated,
   recordSubagentSpawned,
 } from "../../../sessions/session-state-events.js";
+import { assertDefaultSubagentTaskBacking } from "../../../tasks/detached-task-runtime.js";
 import { hasDeliveryTargetFields } from "../../../utils/delivery-context.shared.js";
 import { hasPromptUnsafeControlCharacter } from "../../sanitize-for-prompt.js";
 import {
@@ -27,6 +28,7 @@ import {
   summarizeSpawnError,
 } from "../../spawn-pipeline.js";
 import { getGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
+import { subagentRuns } from "../registry/subagent-registry-memory.js";
 import {
   completeCollectorLaunchCleanup,
   settleFailedQueuedSubagentLaunch,
@@ -582,6 +584,14 @@ export async function spawnSubagentDirect(
         runId: childRunId,
         start: async () => {
           await runWithGatewayIndependentRootWorkContinuation(async () => {
+            const registered = subagentRuns.get(childRunId);
+            assertDefaultSubagentTaskBacking({
+              runId: registered?.taskRunId ?? childRunId,
+              ownerKey: registered?.requesterSessionKey ?? ownership.completionRequesterSessionKey,
+              sessionKey: registered?.childSessionKey ?? childSessionKey,
+              generation: registered?.generation,
+              policy: "queued-dispatch",
+            });
             const launch = await launchChildRun();
             // Queued registration already owns the task row before either dispatch route starts.
             // Out-of-process Gateway tracking finds that exact runId and suppresses its CLI row.

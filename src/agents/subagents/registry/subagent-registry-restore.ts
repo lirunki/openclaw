@@ -9,6 +9,7 @@ import {
   GatewayDrainingError,
 } from "../../../process/gateway-work-admission.js";
 import { emitSessionLifecycleEvent } from "../../../sessions/session-lifecycle-events.js";
+import { assertDefaultSubagentTaskBacking } from "../../../tasks/detached-task-runtime.js";
 import {
   backfillSubagentRequesterAgentIds,
   resolveSubagentRequesterAgentId,
@@ -262,6 +263,13 @@ export function createSubagentRegistryRestorer(config: {
           start: async () => {
             await runWithGatewayIndependentRootWorkAdmission(async () => {
               launchLifecycleGeneration = getAgentEventLifecycleGeneration();
+              assertDefaultSubagentTaskBacking({
+                runId: entry.taskRunId ?? entry.runId,
+                ownerKey: entry.requesterSessionKey,
+                sessionKey: entry.childSessionKey,
+                generation: entry.generation,
+                policy: "queued-dispatch",
+              });
               const request = {
                 params: applySubagentLaunchAuthorization(launch.request, launch.authorization),
                 timeoutMs: launch.timeoutMs,
