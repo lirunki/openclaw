@@ -133,7 +133,7 @@
 }
 
 .chat-position-rail__marker:focus-visible {
-  outline: 2px solid var(--focus-ring);
+  outline: 2px solid var(--ring);
   outline-offset: 1px;
 }
 
@@ -156,7 +156,7 @@
   width: 200px;
   gap: 4px;
   padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--focus-ring) 50%, var(--border));
+  border: 1px solid color-mix(in srgb, var(--ring) 50%, var(--border));
   border-radius: var(--radius-md);
   color: var(--text);
   background: color-mix(in srgb, var(--panel) 94%, var(--bg));
@@ -321,7 +321,7 @@
 }
 
 .chat-image-action:focus-visible {
-  outline: 2px solid var(--focus-ring);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -331,7 +331,7 @@
 }
 
 .chat-message-image-button:focus-visible {
-  outline: 2px solid var(--focus-ring);
+  outline: 2px solid var(--ring);
   outline-offset: -3px;
 }
 
@@ -636,7 +636,7 @@
 }
 
 .chat-assistant-attachment-card__action:focus-visible {
-  outline: 2px solid var(--focus-ring);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
