@@ -33,6 +33,9 @@ import {
 } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import {
+  MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES,
+  MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
+  PLUGIN_STATE_DOCTOR_IMPORT_BATCH_ROWS,
   PluginStateStoreError,
   type PluginStateEntry,
   type PluginStateOverflowPolicy,
@@ -42,12 +45,15 @@ import {
   type PluginStateStoreProbeStep,
 } from "./plugin-state-store.types.js";
 
+export {
+  MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES,
+  MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
+  MAX_PLUGIN_STATE_VALUE_BYTES,
+  PLUGIN_STATE_DOCTOR_IMPORT_BATCH_ROWS,
+} from "./plugin-state-store.types.js";
+
 // Plugin-wide fuse only; namespace maxEntries still owns normal cache eviction.
-export const MAX_PLUGIN_STATE_VALUE_BYTES = 1_048_576;
-export const MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN = 50_000;
-export const MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES = 512;
 const PLUGIN_STATE_EXPIRY_BATCH_ROWS = 1_024;
-export const PLUGIN_STATE_DOCTOR_IMPORT_BATCH_ROWS = 500;
 let maxPluginStateEntriesPerPluginForTests: number | undefined;
 
 type PluginStateEntriesTable = OpenClawStateKyselyDatabase["plugin_state_entries"];
@@ -1175,16 +1181,22 @@ export function pluginStateLookupMany(params: {
             db,
             getPluginStateKysely(db)
               .selectFrom("plugin_state_entries")
-              .select(["entry_key", "value_json"])
+              // node:sqlite on Windows truncates returned TEXT at embedded NUL bytes.
+              // Hex preserves the full key while retaining one set-based query.
+              .select((eb) => [
+                eb.fn<string>("hex", ["entry_key"]).as("entry_key_hex"),
+                "value_json",
+              ])
               .where("plugin_id", "=", params.pluginId)
               .where("namespace", "=", params.namespace)
               .where("entry_key", "in", sqliteStringSet(params.keys))
               .where((eb) => eb.or([eb("expires_at", "is", null), eb("expires_at", ">", now)])),
           ).rows;
-          const values = new Map(rows.map((row) => [row.entry_key, row.value_json]));
+          const values = new Map(rows.map((row) => [row.entry_key_hex, row.value_json]));
           return params.keys.map((key): Result<unknown, PluginStateStoreError> => {
-            // Match node:sqlite text binding, including lone UTF-16 surrogates.
-            const raw = values.get(toUSVString(key));
+            // Match node:sqlite's UTF-8 binding, including lone UTF-16 surrogates.
+            const encodedKey = Buffer.from(toUSVString(key)).toString("hex").toUpperCase();
+            const raw = values.get(encodedKey);
             try {
               return ok(
                 raw === undefined ? undefined : parseStoredJson(raw, "lookup", databasePath),

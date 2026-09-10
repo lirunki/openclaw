@@ -50,6 +50,7 @@ const mocks = vi.hoisted(() => ({
   getAcpSessionManager: vi.fn(() => ({})),
   fenceSessionSuspensionWritesForGatewayShutdown: vi.fn(),
   closePluginStateDatabase: vi.fn(async () => undefined),
+  closePluginStateAzureSqlRuntime: vi.fn(async () => undefined),
   closeProjectRegistryAzureSqlDatabases: vi.fn(async () => undefined),
 }));
 const WEBSOCKET_CLOSE_GRACE_MS = 1_000;
@@ -129,6 +130,7 @@ vi.mock("../plugin-state/plugin-state-store.js", async () => ({
     "../plugin-state/plugin-state-store.js",
   )),
   closePluginStateDatabase: mocks.closePluginStateDatabase,
+  closePluginStateAzureSqlRuntime: mocks.closePluginStateAzureSqlRuntime,
 }));
 
 vi.mock("../storage/project-registry-store-factory.js", async () => ({
@@ -262,6 +264,8 @@ describe("createGatewayCloseHandler", () => {
     mocks.fenceSessionSuspensionWritesForGatewayShutdown.mockReset();
     mocks.closePluginStateDatabase.mockReset();
     mocks.closePluginStateDatabase.mockResolvedValue(undefined);
+    mocks.closePluginStateAzureSqlRuntime.mockReset();
+    mocks.closePluginStateAzureSqlRuntime.mockResolvedValue(undefined);
     mocks.closeProjectRegistryAzureSqlDatabases.mockReset();
     mocks.closeProjectRegistryAzureSqlDatabases.mockResolvedValue(undefined);
   });
@@ -340,14 +344,14 @@ describe("createGatewayCloseHandler", () => {
     expect(deps.chatRunState.clear).toHaveBeenCalledTimes(1);
   });
 
-  it("drains Azure SQL project registry pools during the final teardown", async () => {
+  it("drains Azure SQL storage pools during the final teardown", async () => {
     const close = createGatewayCloseHandler(createGatewayCloseTestDeps());
 
     const result = await close({ reason: "test" });
 
-    // The Azure SQL project registry owns backend-optional pooled connections. The
-    // Gateway close owner must drain them alongside the shared SQLite teardown,
-    // even though the call is a guarded no-op when SQLite is the configured backend.
+    // Backend-optional Azure SQL pools and the temporary sync bridge are not covered
+    // by shared SQLite teardown, so the Gateway close owner must drain both.
+    expect(mocks.closePluginStateAzureSqlRuntime).toHaveBeenCalledTimes(1);
     expect(mocks.closeProjectRegistryAzureSqlDatabases).toHaveBeenCalledTimes(1);
     expect(mocks.closePluginStateDatabase).toHaveBeenCalledTimes(1);
     expect(result.warnings).toStrictEqual([]);

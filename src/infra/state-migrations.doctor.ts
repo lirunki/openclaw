@@ -1896,7 +1896,16 @@ function buildLegacyStateMigrationSteps(
 
   const sharedSteps: LegacyStateMigrationStep[] = [
     ownerStep("shared-auth-store", detected.sharedAuthStore, migrateSharedAuthStore, "shared"),
-    sharedStep("plugin-state-sidecar", () => migrateLegacyPluginStateSidecar({ stateDir })),
+    sharedStep("plugin-state-sidecar", () =>
+      params.config.storage?.backend === "azuresql"
+        ? Promise.resolve({
+            changes: [],
+            warnings: [
+              "Plugin-state sidecar migration is unavailable while Azure SQL is selected. The sidecar was retained; keep it until the offline SQLite-to-Azure plugin-state migrator is implemented.",
+            ],
+          })
+        : migrateLegacyPluginStateSidecar({ stateDir }),
+    ),
     ownerStep(
       "debug-proxy-capture",
       detected.debugProxyCaptureSidecar,

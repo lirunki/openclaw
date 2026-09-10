@@ -47,6 +47,11 @@ export const runtimeProcessEntrypoints = {
     sourceWorkerName: "../state/openclaw-state-lease-heartbeat.worker",
     distWorkerPath: "state/openclaw-state-lease-heartbeat.worker.js",
   },
+  pluginStateSyncBridge: {
+    currentModuleUrl,
+    sourceWorkerName: "../plugin-state/plugin-state-sync-bridge.worker",
+    distWorkerPath: "plugin-state/plugin-state-sync-bridge.worker.js",
+  },
   sessionTranscriptArchive: {
     currentModuleUrl,
     sourceWorkerName: "../config/sessions/session-accessor.sqlite-archive.worker",

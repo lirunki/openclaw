@@ -29,7 +29,9 @@ Backend-neutral storage contracts
 Local filesystem remains the owner of workspaces and named artifacts.
 ```
 
-The abstraction is a compatibility boundary, not a fake implementation of `node:sqlite`. Azure SQL is asynchronous and networked; it must not pretend to provide synchronous `DatabaseSync` or `StatementSync` semantics.
+The abstraction is a compatibility boundary, not a fake implementation of `node:sqlite`. Azure SQL is asynchronous and networked; it must not expose `DatabaseSync` or `StatementSync` as backend contracts.
+
+During the plugin-state migration only, existing trusted synchronous keyed-store callers use an internal blocking worker bridge. The worker executes the canonical asynchronous Azure SQL operations and returns only after the operation succeeds or fails; it does not cache reads, queue deferred writes, or weaken durability. This compatibility path is not a new public SDK capability, must not gain new callers, and is removed after bundled and core plugin-state clients migrate to the asynchronous API.
 
 ## Goals
 

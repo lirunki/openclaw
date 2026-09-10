@@ -12,7 +12,10 @@ import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js
 import { createInternalHookEvent, triggerInternalHook } from "../hooks/internal-hooks.js";
 import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { closePluginStateDatabase } from "../plugin-state/plugin-state-store.js";
+import {
+  closePluginStateAzureSqlRuntime,
+  closePluginStateDatabase,
+} from "../plugin-state/plugin-state-store.js";
 import { clearActivePluginRegistry } from "../plugins/runtime.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
@@ -618,6 +621,7 @@ export async function completeGatewayClose(
     // The Azure SQL project registry owns backend-optional pooled connections that
     // are not covered by the shared SQLite teardown above. Close them after project
     // RPC work has drained; the call is a guarded no-op when SQLite is the backend.
+    await shutdownStep("plugin-state-azure-sql", closePluginStateAzureSqlRuntime, warnings);
     await shutdownStep(
       "project-registry-azure-sql",
       closeProjectRegistryAzureSqlDatabases,

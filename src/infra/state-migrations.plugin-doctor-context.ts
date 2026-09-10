@@ -17,7 +17,7 @@ import { dedupeSessionStoreTargetsBySqliteTarget } from "../config/sessions/targ
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES,
-  createPluginStateKeyedStore,
+  createPluginStateKeyedStoreForRuntime,
   getPluginStateCapacity,
   importPluginStateEntriesForDoctor,
   pluginStateDeleteEntriesIfUnchanged,
@@ -278,21 +278,28 @@ export function createPluginDoctorStateMigrationContext(params: {
       params.repairAuthority?.assertCurrent();
       return evidence;
     },
-    getPluginStateCapacity: () => getPluginStateCapacity(pluginId, env),
+    getPluginStateCapacity: () => getPluginStateCapacity(pluginId, env, params.config),
     importPluginStateEntries(options, entries) {
-      importPluginStateEntriesForDoctor(pluginId, { ...options, env: options.env ?? env }, entries);
+      importPluginStateEntriesForDoctor(
+        pluginId,
+        { ...options, env: options.env ?? env },
+        entries,
+        params.config,
+      );
     },
     openPluginStateKeyedStore<T>(options: OpenKeyedStoreOptions) {
-      return createPluginStateKeyedStore<T>(pluginId, { ...options, env: options.env ?? env });
+      return createPluginStateKeyedStoreForRuntime<T>(
+        pluginId,
+        { ...options, env: options.env ?? env },
+        params.config,
+      );
     },
     readPluginStateEntriesInKeyRange(namespace, range) {
       params.repairAuthority?.assertCurrent();
-      return pluginStateDoctorEntriesInKeyRange({
-        pluginId,
-        namespace,
-        ...range,
-        env,
-      });
+      return pluginStateDoctorEntriesInKeyRange(
+        { pluginId, namespace, ...range, env },
+        params.config,
+      );
     },
     async readSessionIdentityEvidenceBatch(requests) {
       params.repairAuthority?.assertCurrent();
@@ -316,13 +323,16 @@ export function createPluginDoctorStateMigrationContext(params: {
       updateAcpSessionIdentityForDoctor(params, authority, input);
     context.deletePluginStateEntriesIfUnchanged = (namespace, entries) => {
       authority.assertCurrent();
-      return pluginStateDeleteEntriesIfUnchanged({
-        pluginId,
-        namespace,
-        entries,
-        env,
-        assertOwnedInTransaction: (database) => authority.assertOwnedInTransaction(database),
-      });
+      return pluginStateDeleteEntriesIfUnchanged(
+        {
+          pluginId,
+          namespace,
+          entries,
+          env,
+          assertOwnedInTransaction: (database) => authority.assertOwnedInTransaction(database),
+        },
+        params.config,
+      );
     };
   }
   return context;

@@ -1,5 +1,10 @@
 import type { Result } from "@openclaw/normalization-core/result";
 
+export const MAX_PLUGIN_STATE_VALUE_BYTES = 1_048_576;
+export const MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN = 50_000;
+export const MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES = 512;
+export const PLUGIN_STATE_DOCTOR_IMPORT_BATCH_ROWS = 500;
+
 // Public plugin-state store contracts. Stores are keyed by plugin id and
 // namespace, persist JSON-compatible values, and enforce per-namespace limits.
 export type PluginStateEntry<T> = {

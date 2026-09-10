@@ -9,7 +9,9 @@ import {
 } from "../plugin-state/plugin-blob-store.js";
 import {
   createPluginStateKeyedStore,
+  createPluginStateKeyedStoreForRuntime,
   createPluginStateSyncKeyedStore,
+  createPluginStateSyncKeyedStoreForRuntime,
   type OpenKeyedStoreOptions,
 } from "../plugin-state/plugin-state-store.js";
 import { createLazyRuntimeSurface } from "../shared/lazy-runtime.js";
@@ -222,11 +224,17 @@ export function createPluginRuntimeResolver(state: PluginRegistryState) {
             },
             openKeyedStore: <T>(options: OpenKeyedStoreOptions) => {
               assertTrustedPluginRuntime("openKeyedStore");
-              return createPluginStateKeyedStore<T>(pluginId, options);
+              const config = registryParams.runtime.config?.current?.();
+              return config
+                ? createPluginStateKeyedStoreForRuntime<T>(pluginId, options, config)
+                : createPluginStateKeyedStore<T>(pluginId, options);
             },
             openSyncKeyedStore: <T>(options: OpenKeyedStoreOptions) => {
               assertTrustedPluginRuntime("openSyncKeyedStore");
-              return createPluginStateSyncKeyedStore<T>(pluginId, options);
+              const config = registryParams.runtime.config?.current?.();
+              return config
+                ? createPluginStateSyncKeyedStoreForRuntime<T>(pluginId, options, config)
+                : createPluginStateSyncKeyedStore<T>(pluginId, options);
             },
             openChannelIngressQueue: <TPayload, TMetadata = unknown, TCompletedMetadata = unknown>(
               options?: Omit<Parameters<typeof createChannelIngressQueue>[0], "channelId">,

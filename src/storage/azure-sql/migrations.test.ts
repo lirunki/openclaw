@@ -99,19 +99,22 @@ describe("runAzureSqlMigrations", () => {
     expect(database.executedSql[1]).toContain("CREATE SCHEMA");
   });
 
-  it("rejects migrations recorded by a newer build", async () => {
+  it("allows an independently owned older migration", async () => {
     const database = new FakeMigrationDatabase();
-    database.applied.set("global.projects.v2", {
-      version: 2,
-      checksum_sha256: "newer-checksum",
+    database.applied.set("global.projects.v1", {
+      version: 1,
+      checksum_sha256: "owned-by-another-storage-slice",
     });
 
     await expect(
       runAzureSqlMigrations(database as unknown as AzureSqlDatabase, [
-        { id: "global.projects.v1", version: 1, sql: "CREATE TABLE projects_v1 (id int);" },
+        {
+          id: "global.plugin-state.v1",
+          version: 3,
+          sql: "CREATE TABLE plugin_state_entries (id int);",
+        },
       ]),
-    ).rejects.toThrow("newer than this build");
-    expect(database.rollbacks).toBe(1);
+    ).resolves.toEqual({ applied: ["global.plugin-state.v1"], alreadyApplied: [] });
   });
 
   it("rejects migration checksum drift", async () => {

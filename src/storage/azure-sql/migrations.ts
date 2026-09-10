@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import mssql from "mssql";
-import type { AzureSqlProjectDatabase } from "./project-registry-store.js";
-import type { AzureSqlTransaction } from "./runtime.js";
+import type { AzureSqlDatabase, AzureSqlTransaction } from "./runtime.js";
 
 const MIGRATION_SCHEMA = "openclaw_global";
 const MIGRATION_TABLE = `[${MIGRATION_SCHEMA}].[storage_migrations]`;
@@ -89,8 +88,10 @@ async function readAppliedMigrations(
   return new Map(result.rows.map((row) => [row.migration_id, row]));
 }
 
+export type AzureSqlMigrationDatabase = Pick<AzureSqlDatabase, "transaction">;
+
 export async function runAzureSqlMigrations(
-  database: AzureSqlProjectDatabase,
+  database: AzureSqlMigrationDatabase,
   migrations: readonly AzureSqlMigration[],
   now: () => number = Date.now,
 ): Promise<AzureSqlMigrationResult> {
@@ -100,13 +101,6 @@ export async function runAzureSqlMigrations(
     await transaction.query(ACQUIRE_MIGRATION_LOCK_SQL);
     await transaction.query(MIGRATION_TABLE_SQL);
     const applied = await readAppliedMigrations(transaction);
-    const knownIds = new Set(ordered.map((migration) => migration.id));
-    const unknownApplied = [...applied.keys()].filter((id) => !knownIds.has(id)).toSorted();
-    if (unknownApplied.length > 0) {
-      throw new Error(
-        `Azure SQL schema contains migrations newer than this build: ${unknownApplied.join(", ")}`,
-      );
-    }
     const result: AzureSqlMigrationResult = { applied: [], alreadyApplied: [] };
     for (const migration of ordered) {
       const checksum = migrationChecksum(migration.sql);

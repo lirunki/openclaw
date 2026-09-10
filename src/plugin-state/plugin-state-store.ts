@@ -1,23 +1,39 @@
 // Plugin state store exposes persisted per-plugin state operations.
 import type { Result } from "@openclaw/normalization-core/result";
+import { getRuntimeConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import type {
+  AzureSqlPluginStateScope,
+  AzureSqlPluginStateStore,
+} from "../storage/azure-sql/plugin-state-store.js";
+import { resolveStorageBackend } from "../storage/storage-backend.js";
+import type { PluginDoctorRawStateEntry } from "./plugin-state-store.sqlite.js";
 import {
   clearPluginStateDatabaseForTests,
   closePluginStateDatabase,
+  countPluginStateLiveEntries as countPluginStateLiveEntriesSqlite,
+  getPluginStateCapacity as getPluginStateCapacitySqlite,
+  MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES,
+  MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
   MAX_PLUGIN_STATE_VALUE_BYTES,
   PLUGIN_STATE_DOCTOR_IMPORT_BATCH_ROWS,
   pluginStateImportBatch,
   pluginStateClear,
   pluginStateConsume,
   pluginStateDelete,
+  pluginStateDeleteEntriesIfUnchanged as pluginStateDeleteEntriesIfUnchangedSqlite,
   pluginStateDeleteIf,
+  pluginStateDoctorEntriesInKeyRange as pluginStateDoctorEntriesInKeyRangeSqlite,
   pluginStateEntries,
+  pluginStateEntriesInKeyRange as pluginStateEntriesInKeyRangeSqlite,
   pluginStateLookup,
   pluginStateLookupMany,
   pluginStateRegister,
   pluginStateRegisterIfAbsent,
   pluginStateRegisterSequencedJournalEntry,
   pluginStateUpdate,
+  sweepExpiredPluginStateEntries as sweepExpiredPluginStateEntriesSqlite,
 } from "./plugin-state-store.sqlite.js";
 import type {
   OpenKeyedStoreOptions,
@@ -28,6 +44,10 @@ import type {
   PluginStateStoreOperation,
 } from "./plugin-state-store.types.js";
 import { PluginStateStoreError } from "./plugin-state-store.types.js";
+import {
+  AzureSqlPluginStateSyncBridge,
+  closePluginStateSyncBridgeWorker,
+} from "./plugin-state-sync-bridge.js";
 import {
   createPluginStoreOptionPolicy,
   serializePluginStoreJson,
@@ -49,15 +69,9 @@ export type { PluginDoctorRawStateEntry } from "./plugin-state-store.sqlite.js";
 
 export {
   closePluginStateDatabase,
-  countPluginStateLiveEntries,
-  getPluginStateCapacity,
   MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
   MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES,
-  pluginStateDeleteEntriesIfUnchanged,
-  pluginStateDoctorEntriesInKeyRange,
-  pluginStateEntriesInKeyRange,
   resolveMaxPluginStateEntriesPerPlugin,
-  sweepExpiredPluginStateEntries,
 } from "./plugin-state-store.sqlite.js";
 
 type StoreOptionSignature = {
@@ -165,12 +179,61 @@ function prepareRegisterParams(
   };
 }
 
-function createKeyedStoreForPluginId<T>(
+type DeepReadonly<T> = T extends (...args: never[]) => unknown
+  ? T
+  : T extends readonly (infer U)[]
+    ? ReadonlyArray<DeepReadonly<U>>
+    : T extends object
+      ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+      : T;
+
+type PluginStateRuntimeContext = {
+  config?: DeepReadonly<OpenClawConfig>;
+};
+
+type PreparedStoreContext = {
+  namespace: string;
+  maxEntries: number;
+  overflowPolicy: PluginStateOverflowPolicy;
+  defaultTtlMs?: number;
+  env?: NodeJS.ProcessEnv;
+};
+
+function resolvePluginStateConfig(context?: PluginStateRuntimeContext): OpenClawConfig {
+  if (context?.config) {
+    // SAFETY: structuredClone removes readonly views while preserving the config data shape.
+    return structuredClone(context.config) as OpenClawConfig;
+  }
+  return getRuntimeConfig({ skipPluginValidation: true, skipShellEnvFallback: true });
+}
+
+function prepareStoreContext(
+  pluginId: string,
+  options: OpenKeyedStoreOptions,
+): PreparedStoreContext {
+  const namespace = validateNamespace(options.namespace);
+  const maxEntries = validateMaxEntries(options.maxEntries);
+  const overflowPolicy = optionPolicy.resolveOverflowPolicy(options.overflowPolicy);
+  const defaultTtlMs = validateOptionalTtlMs(options.defaultTtlMs);
+  optionPolicy.assertConsistent(pluginId, namespace, {
+    maxEntries,
+    overflowPolicy,
+    defaultTtlMs,
+  });
+  return {
+    namespace,
+    maxEntries,
+    overflowPolicy,
+    defaultTtlMs,
+    ...(options.env ? { env: options.env } : {}),
+  };
+}
+
+function createSqliteKeyedStoreForPluginId<T>(
   pluginId: string,
   options: OpenKeyedStoreOptions,
 ): Required<PluginStateKeyedStore<T>> {
-  const store = createSyncKeyedStoreForPluginId<T>(pluginId, options);
-
+  const store = createSqliteSyncKeyedStoreForPluginId<T>(pluginId, options);
   return {
     register: async (...args) => store.register(...args),
     registerIfAbsent: async (...args) => store.registerIfAbsent(...args),
@@ -185,20 +248,14 @@ function createKeyedStoreForPluginId<T>(
   };
 }
 
-function createSyncKeyedStoreForPluginId<T>(
+function createSqliteSyncKeyedStoreForPluginId<T>(
   pluginId: string,
   options: OpenKeyedStoreOptions,
 ): Required<PluginStateSyncKeyedStore<T>> {
-  const namespace = validateNamespace(options.namespace);
-  const maxEntries = validateMaxEntries(options.maxEntries);
-  const overflowPolicy = optionPolicy.resolveOverflowPolicy(options.overflowPolicy);
-  const defaultTtlMs = validateOptionalTtlMs(options.defaultTtlMs);
-  const env = options.env;
-  optionPolicy.assertConsistent(pluginId, namespace, {
-    maxEntries,
-    overflowPolicy,
-    defaultTtlMs,
-  });
+  const { namespace, maxEntries, overflowPolicy, defaultTtlMs, env } = prepareStoreContext(
+    pluginId,
+    options,
+  );
 
   return {
     register(key, value, opts) {
@@ -313,6 +370,206 @@ function createSyncKeyedStoreForPluginId<T>(
   };
 }
 
+function createAzureSqlStoreScope(
+  pluginId: string,
+  context: PreparedStoreContext,
+): AzureSqlPluginStateScope {
+  return {
+    pluginId,
+    namespace: context.namespace,
+    maxEntries: context.maxEntries,
+    overflowPolicy: context.overflowPolicy,
+  };
+}
+
+function createAzureSqlKeyedStoreForPluginId<T>(
+  pluginId: string,
+  options: OpenKeyedStoreOptions,
+  config: OpenClawConfig,
+): Required<PluginStateKeyedStore<T>> {
+  const context = prepareStoreContext(pluginId, options);
+  const scope = createAzureSqlStoreScope(pluginId, context);
+  let storePromise: Promise<AzureSqlPluginStateStore> | undefined;
+  const getStore = (): Promise<AzureSqlPluginStateStore> => {
+    if (storePromise) {
+      return storePromise;
+    }
+    storePromise = (async () => {
+      const [{ createAzureSqlPluginStateStore }, { resolvePluginStateRuntimeOptions }] =
+        await Promise.all([
+          import("../storage/plugin-state-store-factory.js"),
+          import("../storage/plugin-state-runtime-options.js"),
+        ]);
+      return createAzureSqlPluginStateStore(
+        await resolvePluginStateRuntimeOptions(config, context.env ?? process.env),
+      );
+    })();
+    void storePromise.catch(() => {
+      storePromise = undefined;
+    });
+    return storePromise;
+  };
+
+  return {
+    async register(key, value, opts) {
+      const input = prepareRegisterParams(key, value, context.defaultTtlMs, opts);
+      await (await getStore()).register(scope, input);
+    },
+    async registerIfAbsent(key, value, opts) {
+      const input = prepareRegisterParams(key, value, context.defaultTtlMs, opts);
+      return await (await getStore()).registerIfAbsent(scope, input);
+    },
+    async update(key, updateValue, opts) {
+      const normalizedKey = validateKey(key, "register");
+      return await (
+        await getStore()
+      ).update(scope, normalizedKey, (current) => {
+        // SAFETY: values in this namespace were serialized through this typed store.
+        const next = updateValue(current as T | undefined);
+        if (next === undefined) {
+          return undefined;
+        }
+        const input = prepareRegisterParams(normalizedKey, next, context.defaultTtlMs, opts);
+        return {
+          valueJson: input.valueJson,
+          ...(input.ttlMs == null ? {} : { ttlMs: input.ttlMs }),
+        };
+      });
+    },
+    async deleteIf(key, predicate) {
+      const normalizedKey = validateKey(key, "delete");
+      return await (
+        await getStore()
+      ).deleteIf(scope, normalizedKey, (current) => {
+        // SAFETY: values in this namespace were serialized through this typed store.
+        return predicate(current as T);
+      });
+    },
+    async lookup(key) {
+      const normalizedKey = validateKey(key, "lookup");
+      // SAFETY: values in this namespace were serialized through this typed store.
+      return (await (await getStore()).lookup(scope, normalizedKey)) as T | undefined;
+    },
+    async lookupMany(keys) {
+      if (keys.length > 10_000) {
+        throw invalidInput("plugin state lookupMany accepts at most 10000 keys", "lookup");
+      }
+      const normalizedKeys = Array.from(keys, (key) => validateKey(key, "lookup"));
+      // SAFETY: each successful value belongs to this typed namespace.
+      return (await (await getStore()).lookupMany(scope, normalizedKeys)) as Array<
+        Result<T | undefined, PluginStateStoreError>
+      >;
+    },
+    async consume(key) {
+      const normalizedKey = validateKey(key, "consume");
+      // SAFETY: values in this namespace were serialized through this typed store.
+      return (await (await getStore()).consume(scope, normalizedKey)) as T | undefined;
+    },
+    async delete(key) {
+      const normalizedKey = validateKey(key, "delete");
+      return await (await getStore()).delete(scope, normalizedKey);
+    },
+    async entries() {
+      // SAFETY: every entry belongs to this typed namespace.
+      return (await (await getStore()).entries(scope)) as PluginStateEntry<T>[];
+    },
+    async clear() {
+      await (await getStore()).clear(scope);
+    },
+  };
+}
+
+function createAzureSqlSyncKeyedStoreForPluginId<T>(
+  pluginId: string,
+  options: OpenKeyedStoreOptions,
+  config: OpenClawConfig,
+): Required<PluginStateSyncKeyedStore<T>> {
+  const context = prepareStoreContext(pluginId, options);
+  const bridge = new AzureSqlPluginStateSyncBridge(
+    config,
+    context.env ?? process.env,
+    createAzureSqlStoreScope(pluginId, context),
+  );
+  return {
+    register(key, value, opts) {
+      bridge.register(prepareRegisterParams(key, value, context.defaultTtlMs, opts));
+    },
+    registerIfAbsent(key, value, opts) {
+      return bridge.registerIfAbsent(prepareRegisterParams(key, value, context.defaultTtlMs, opts));
+    },
+    update(key, updateValue, opts) {
+      const normalizedKey = validateKey(key, "register");
+      return bridge.update(normalizedKey, (current) => {
+        // SAFETY: values in this namespace were serialized through this typed store.
+        const next = updateValue(current as T | undefined);
+        if (next === undefined) {
+          return undefined;
+        }
+        const input = prepareRegisterParams(normalizedKey, next, context.defaultTtlMs, opts);
+        return {
+          valueJson: input.valueJson,
+          ...(input.ttlMs == null ? {} : { ttlMs: input.ttlMs }),
+        };
+      });
+    },
+    deleteIf(key, predicate) {
+      return bridge.deleteIf(validateKey(key, "delete"), (current) => {
+        // SAFETY: values in this namespace were serialized through this typed store.
+        return predicate(current as T);
+      });
+    },
+    lookup(key) {
+      return bridge.lookup<T>(validateKey(key, "lookup"));
+    },
+    lookupMany(keys) {
+      if (keys.length > 10_000) {
+        throw invalidInput("plugin state lookupMany accepts at most 10000 keys", "lookup");
+      }
+      return bridge.lookupMany<T>(Array.from(keys, (key) => validateKey(key, "lookup")));
+    },
+    consume(key) {
+      return bridge.consume<T>(validateKey(key, "consume"));
+    },
+    delete(key) {
+      return bridge.delete(validateKey(key, "delete"));
+    },
+    entries() {
+      return bridge.entries<T>();
+    },
+    clear() {
+      bridge.clear();
+    },
+  };
+}
+
+function createKeyedStoreForPluginId<T>(
+  pluginId: string,
+  options: OpenKeyedStoreOptions,
+  runtimeContext?: PluginStateRuntimeContext,
+): Required<PluginStateKeyedStore<T>> {
+  if (runtimeContext?.config && runtimeContext.config.storage?.backend !== "azuresql") {
+    return createSqliteKeyedStoreForPluginId<T>(pluginId, options);
+  }
+  const config = resolvePluginStateConfig(runtimeContext);
+  return resolveStorageBackend(config) === "azuresql"
+    ? createAzureSqlKeyedStoreForPluginId<T>(pluginId, options, config)
+    : createSqliteKeyedStoreForPluginId<T>(pluginId, options);
+}
+
+function createSyncKeyedStoreForPluginId<T>(
+  pluginId: string,
+  options: OpenKeyedStoreOptions,
+  runtimeContext?: PluginStateRuntimeContext,
+): Required<PluginStateSyncKeyedStore<T>> {
+  if (runtimeContext?.config && runtimeContext.config.storage?.backend !== "azuresql") {
+    return createSqliteSyncKeyedStoreForPluginId<T>(pluginId, options);
+  }
+  const config = resolvePluginStateConfig(runtimeContext);
+  return resolveStorageBackend(config) === "azuresql"
+    ? createAzureSqlSyncKeyedStoreForPluginId<T>(pluginId, options, config)
+    : createSqliteSyncKeyedStoreForPluginId<T>(pluginId, options);
+}
+
 /**
  * Migration-only write path that preserves a legacy entry's original creation
  * timestamp. Cap eviction removes the oldest `created_at` first, so imported
@@ -345,16 +602,29 @@ export function registerMigratedPluginStateEntry(params: {
     defaultTtlMs,
     params.ttlMs != null ? { ttlMs: params.ttlMs } : undefined,
   );
+  const input = {
+    key: prepared.key,
+    valueJson: prepared.valueJson,
+    createdAtMs: Math.floor(params.createdAtMs),
+    ...(prepared.ttlMs != null ? { ttlMs: prepared.ttlMs } : {}),
+  };
+  const config = resolvePluginStateConfig();
+  if (resolveStorageBackend(config) === "azuresql") {
+    new AzureSqlPluginStateSyncBridge(config, params.env ?? process.env, {
+      pluginId: params.pluginId,
+      namespace,
+      maxEntries,
+      overflowPolicy,
+    }).register(input);
+    return;
+  }
   pluginStateRegister({
     pluginId: params.pluginId,
     namespace,
-    key: prepared.key,
-    valueJson: prepared.valueJson,
     maxEntries,
     overflowPolicy,
-    createdAtMs: Math.floor(params.createdAtMs),
+    ...input,
     ...(params.env ? { env: params.env } : {}),
-    ...(prepared.ttlMs != null ? { ttlMs: prepared.ttlMs } : {}),
   });
 }
 
@@ -369,6 +639,18 @@ export function createPluginStateKeyedStore<T>(
   return createKeyedStoreForPluginId<T>(pluginId, options);
 }
 
+/** Host-bound variant that uses the immutable config snapshot which created the plugin runtime. */
+export function createPluginStateKeyedStoreForRuntime<T>(
+  pluginId: string,
+  options: OpenKeyedStoreOptions,
+  config: DeepReadonly<OpenClawConfig>,
+): Required<PluginStateKeyedStore<T>> {
+  if (pluginId.startsWith("core:")) {
+    throw invalidInput("Plugin ids starting with 'core:' are reserved for core consumers.", "open");
+  }
+  return createKeyedStoreForPluginId<T>(pluginId, options, { config });
+}
+
 /** Opens a sync plugin-state namespace for a non-core plugin id. */
 export function createPluginStateSyncKeyedStore<T>(
   pluginId: string,
@@ -378,6 +660,18 @@ export function createPluginStateSyncKeyedStore<T>(
     throw invalidInput("Plugin ids starting with 'core:' are reserved for core consumers.", "open");
   }
   return createSyncKeyedStoreForPluginId<T>(pluginId, options);
+}
+
+/** Host-bound sync variant used by the trusted plugin runtime proxy. */
+export function createPluginStateSyncKeyedStoreForRuntime<T>(
+  pluginId: string,
+  options: OpenKeyedStoreOptions,
+  config: DeepReadonly<OpenClawConfig>,
+): Required<PluginStateSyncKeyedStore<T>> {
+  if (pluginId.startsWith("core:")) {
+    throw invalidInput("Plugin ids starting with 'core:' are reserved for core consumers.", "open");
+  }
+  return createSyncKeyedStoreForPluginId<T>(pluginId, options, { config });
 }
 
 /** Atomically allocates a workspace sequence and appends one journal entry. */
@@ -430,6 +724,53 @@ export function registerPluginStateSyncSequencedJournalEntry(params: {
     overflowPolicy: journalOverflowPolicy,
     defaultTtlMs: journalDefaultTtlMs,
   });
+  const readCursorSequence = (valueJson: string): number | undefined => {
+    try {
+      const value = JSON.parse(valueJson) as { kind?: unknown; lastSequence?: unknown };
+      return value.kind === "cursor" && Number.isSafeInteger(value.lastSequence)
+        ? (value.lastSequence as number)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const prepareEntry = (sequence: number) => {
+    const cursor = prepareRegisterParams(cursorKey, { kind: "cursor", lastSequence: sequence });
+    const journal = prepareRegisterParams(
+      params.journalKey(sequence),
+      params.journalValue(sequence),
+    );
+    return {
+      cursorValueJson: cursor.valueJson,
+      journalKey: journal.key,
+      journalValueJson: journal.valueJson,
+    };
+  };
+  const config = resolvePluginStateConfig();
+  if (resolveStorageBackend(config) === "azuresql") {
+    const bridge = new AzureSqlPluginStateSyncBridge(
+      config,
+      params.cursorOptions.env ?? process.env,
+      {
+        pluginId: params.pluginId,
+        namespace: cursorNamespace,
+        maxEntries: cursorMaxEntries,
+        overflowPolicy: cursorOverflowPolicy,
+      },
+    );
+    return bridge.appendSequencedJournalEntry({
+      journalScope: {
+        pluginId: params.pluginId,
+        namespace: journalNamespace,
+        maxEntries: journalMaxEntries,
+        overflowPolicy: journalOverflowPolicy,
+      },
+      cursorKey,
+      initialSequence: params.initialSequence,
+      readCursorSequence,
+      prepareEntry,
+    });
+  }
   return pluginStateRegisterSequencedJournalEntry({
     pluginId: params.pluginId,
     cursorNamespace,
@@ -438,28 +779,8 @@ export function registerPluginStateSyncSequencedJournalEntry(params: {
     journalNamespace,
     journalMaxEntries,
     initialSequence: params.initialSequence,
-    readCursorSequence(valueJson) {
-      try {
-        const value = JSON.parse(valueJson) as { kind?: unknown; lastSequence?: unknown };
-        return value.kind === "cursor" && Number.isSafeInteger(value.lastSequence)
-          ? (value.lastSequence as number)
-          : undefined;
-      } catch {
-        return undefined;
-      }
-    },
-    prepareEntry(sequence) {
-      const cursor = prepareRegisterParams(cursorKey, { kind: "cursor", lastSequence: sequence });
-      const journal = prepareRegisterParams(
-        params.journalKey(sequence),
-        params.journalValue(sequence),
-      );
-      return {
-        cursorValueJson: cursor.valueJson,
-        journalKey: journal.key,
-        journalValueJson: journal.valueJson,
-      };
-    },
+    readCursorSequence,
+    prepareEntry,
     ...(params.cursorOptions.env ? { env: params.cursorOptions.env } : {}),
   });
 }
@@ -469,6 +790,7 @@ export function importPluginStateEntriesForDoctor(
   pluginId: string,
   options: OpenKeyedStoreOptions,
   entries: readonly PluginStateImportEntry[],
+  runtimeConfig?: DeepReadonly<OpenClawConfig>,
 ): void {
   if (pluginId.startsWith("core:")) {
     throw invalidInput("Plugin ids starting with 'core:' are reserved for core consumers.", "open");
@@ -484,9 +806,23 @@ export function importPluginStateEntriesForDoctor(
     defaultTtlMs,
   });
 
+  const config = resolvePluginStateConfig(runtimeConfig ? { config: runtimeConfig } : undefined);
+  const azureBridge =
+    resolveStorageBackend(config) === "azuresql"
+      ? new AzureSqlPluginStateSyncBridge(config, env ?? process.env, {
+          pluginId,
+          namespace,
+          maxEntries,
+          overflowPolicy,
+        })
+      : undefined;
   let batch: Array<PreparedRegisterParams & { createdAtMs: number }> = [];
   const flush = () => {
-    pluginStateImportBatch({ pluginId, namespace, maxEntries, overflowPolicy, env }, batch);
+    if (azureBridge) {
+      azureBridge.importBatch(batch);
+    } else {
+      pluginStateImportBatch({ pluginId, namespace, maxEntries, overflowPolicy, env }, batch);
+    }
     batch = [];
   };
   for (const entry of entries) {
@@ -518,6 +854,164 @@ export function createCorePluginStateSyncKeyedStore<T>(
   options: OpenKeyedStoreOptions & { ownerId: `core:${string}` },
 ): Required<PluginStateSyncKeyedStore<T>> {
   return createSyncKeyedStoreForPluginId<T>(options.ownerId, options);
+}
+
+type PluginStateKeyRangeParams = {
+  pluginId: string;
+  namespace: string;
+  keyStartInclusive: string;
+  keyEndExclusive: string;
+  limit: number;
+  order?: "asc" | "desc";
+  env?: NodeJS.ProcessEnv;
+};
+
+function createAzureSqlAdminBridge(
+  params: { pluginId: string; namespace: string; env?: NodeJS.ProcessEnv },
+  runtimeConfig?: DeepReadonly<OpenClawConfig>,
+): AzureSqlPluginStateSyncBridge | undefined {
+  const config = resolvePluginStateConfig(runtimeConfig ? { config: runtimeConfig } : undefined);
+  return resolveStorageBackend(config) === "azuresql"
+    ? new AzureSqlPluginStateSyncBridge(config, params.env ?? process.env, {
+        pluginId: params.pluginId,
+        namespace: params.namespace,
+        maxEntries: MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
+        overflowPolicy: "evict-oldest",
+      })
+    : undefined;
+}
+
+export function pluginStateEntriesInKeyRange(
+  params: PluginStateKeyRangeParams,
+): PluginStateEntry<unknown>[] {
+  const bridge = createAzureSqlAdminBridge(params);
+  if (!bridge) {
+    return pluginStateEntriesInKeyRangeSqlite(params);
+  }
+  if (!Number.isSafeInteger(params.limit) || params.limit < 1) {
+    throw invalidInput("Plugin state key-range limit must be a positive safe integer.", "entries");
+  }
+  if (params.keyStartInclusive >= params.keyEndExclusive) {
+    throw invalidInput(
+      "Plugin state key range must have an increasing exclusive upper bound.",
+      "entries",
+    );
+  }
+  return bridge.entriesInKeyRange(params).map((entry) => {
+    let value: unknown;
+    try {
+      value = JSON.parse(entry.valueJson) as unknown;
+    } catch (error) {
+      throw new PluginStateStoreError("Plugin state entry contains corrupt JSON.", {
+        code: "PLUGIN_STATE_CORRUPT",
+        operation: "entries",
+        cause: error,
+      });
+    }
+    return {
+      key: entry.key,
+      value,
+      createdAt: entry.createdAt,
+      ...(entry.expiresAt === null ? {} : { expiresAt: entry.expiresAt }),
+    };
+  });
+}
+
+export function pluginStateDoctorEntriesInKeyRange(
+  params: {
+    pluginId: string;
+    namespace: string;
+    prefix: string;
+    after?: string;
+    limit: number;
+    env?: NodeJS.ProcessEnv;
+  },
+  runtimeConfig?: DeepReadonly<OpenClawConfig>,
+): PluginDoctorRawStateEntry[] {
+  const bridge = createAzureSqlAdminBridge(params, runtimeConfig);
+  if (!bridge) {
+    return pluginStateDoctorEntriesInKeyRangeSqlite(params);
+  }
+  if (
+    !params.prefix ||
+    !Number.isSafeInteger(params.limit) ||
+    params.limit < 1 ||
+    params.limit > MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES ||
+    (params.after !== undefined && !params.after.startsWith(params.prefix))
+  ) {
+    throw new RangeError(
+      `Plugin doctor state reads require a valid prefix and a limit of 1-${MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES}.`,
+    );
+  }
+  return bridge
+    .entriesInKeyRange({
+      keyStartInclusive: params.after === undefined ? params.prefix : `${params.after}\0`,
+      keyEndExclusive: `${params.prefix}\uffff`,
+      limit: params.limit,
+    })
+    .map((entry) => {
+      const result: PluginDoctorRawStateEntry = {
+        key: entry.key,
+        valueJson: entry.valueJson,
+        createdAt: entry.createdAt,
+        expiresAt: entry.expiresAt,
+      };
+      try {
+        result.value = JSON.parse(entry.valueJson) as unknown;
+      } catch {
+        // Doctor must retain corrupt rows so repair can advance past them.
+      }
+      return result;
+    });
+}
+
+export function countPluginStateLiveEntries(pluginId: string, env?: NodeJS.ProcessEnv): number {
+  const bridge = createAzureSqlAdminBridge({ pluginId, namespace: "capacity", env });
+  return bridge ? bridge.countLiveEntries() : countPluginStateLiveEntriesSqlite(pluginId, env);
+}
+
+export function getPluginStateCapacity(
+  pluginId: string,
+  env?: NodeJS.ProcessEnv,
+  runtimeConfig?: DeepReadonly<OpenClawConfig>,
+): { liveEntries: number; maxEntries: number } {
+  const bridge = createAzureSqlAdminBridge({ pluginId, namespace: "capacity", env }, runtimeConfig);
+  return bridge
+    ? { liveEntries: bridge.countLiveEntries(), maxEntries: MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN }
+    : getPluginStateCapacitySqlite(pluginId, env);
+}
+
+export function sweepExpiredPluginStateEntries(): number {
+  const bridge = createAzureSqlAdminBridge({ pluginId: "core:sweep", namespace: "expiry" });
+  return bridge ? bridge.sweepExpired() : sweepExpiredPluginStateEntriesSqlite();
+}
+
+export function pluginStateDeleteEntriesIfUnchanged(
+  params: {
+    pluginId: string;
+    namespace: string;
+    entries: readonly PluginDoctorRawStateEntry[];
+    assertOwnedInTransaction: Parameters<
+      typeof pluginStateDeleteEntriesIfUnchangedSqlite
+    >[0]["assertOwnedInTransaction"];
+    env?: NodeJS.ProcessEnv;
+  },
+  runtimeConfig?: DeepReadonly<OpenClawConfig>,
+): { deleted: number; changed: number } {
+  if (createAzureSqlAdminBridge(params, runtimeConfig)) {
+    throw new PluginStateStoreError(
+      "Azure SQL plugin-state repair deletion is unavailable until Doctor owns Azure transaction authority.",
+      { code: "PLUGIN_STATE_WRITE_FAILED", operation: "delete" },
+    );
+  }
+  return pluginStateDeleteEntriesIfUnchangedSqlite(params);
+}
+
+export async function closePluginStateAzureSqlRuntime(): Promise<void> {
+  await closePluginStateSyncBridgeWorker();
+  const { closePluginStateAzureSqlDatabases } =
+    await import("../storage/plugin-state-store-factory.js");
+  await closePluginStateAzureSqlDatabases();
 }
 
 /** Clears plugin-state rows and option signatures for tests. */
