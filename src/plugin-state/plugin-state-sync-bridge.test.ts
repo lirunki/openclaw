@@ -1,24 +1,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const childState = vi.hoisted(() => ({
-  spawnSync: vi.fn(),
-  result: {
-    pid: 123,
-    output: [],
-    stdout: '{"ok":true}',
-    stderr: "",
-    status: 0,
-    signal: null,
-  },
+const bridgeState = vi.hoisted(() => ({
+  request: vi.fn(),
 }));
 
-vi.mock("node:child_process", () => ({
-  spawnSync: (...args: unknown[]) => {
-    childState.spawnSync(...args);
-    return childState.result;
-  },
-}));
+vi.mock("../storage/storage-sync-bridge.js", () => {
+  class StorageSyncBridgeTimeoutError extends Error {}
+  class StorageSyncBridgeRemoteError extends Error {
+    readonly remote: { name: string; message: string; code?: string; operation?: string };
 
+    constructor(remote: { name: string; message: string; code?: string; operation?: string }) {
+      super(remote.message);
+      this.name = remote.name;
+      this.remote = remote;
+    }
+  }
+  return {
+    closeStorageSyncBridge: vi.fn(async () => undefined),
+    requestStorageSyncBridge: bridgeState.request,
+    StorageSyncBridgeRemoteError,
+    StorageSyncBridgeTimeoutError,
+  };
+});
+
+import {
+  StorageSyncBridgeRemoteError,
+  StorageSyncBridgeTimeoutError,
+} from "../storage/storage-sync-bridge.js";
 import { AzureSqlPluginStateSyncBridge } from "./plugin-state-sync-bridge.js";
 
 const config = {
@@ -36,47 +44,39 @@ const scope = {
 };
 
 afterEach(() => {
-  childState.spawnSync.mockReset();
-  childState.result = {
-    pid: 123,
-    output: [],
-    stdout: '{"ok":true}',
-    stderr: "",
-    status: 0,
-    signal: null,
-  };
+  bridgeState.request.mockReset();
 });
 
 describe("AzureSqlPluginStateSyncBridge", () => {
-  it("blocks until the bridge process returns the durable value", () => {
-    childState.result.stdout = JSON.stringify({
-      ok: true,
-      value: {
-        key: "thread:1",
-        valueJson: '{"session":"main"}',
-        createdAt: 1,
-        expiresAt: null,
-      },
+  it("returns the durable value from the shared synchronous mailbox", () => {
+    bridgeState.request.mockReturnValue({
+      key: "thread:1",
+      valueJson: '{"session":"main"}',
+      createdAt: 1,
+      expiresAt: null,
     });
 
-    const bridge = new AzureSqlPluginStateSyncBridge(config, {}, scope);
+    const env = { OPENCLAW_TEST: "1" };
+    const bridge = new AzureSqlPluginStateSyncBridge(config, env, scope);
     expect(bridge.lookup("thread:1")).toEqual({ session: "main" });
-    expect(childState.spawnSync).toHaveBeenCalledWith(
-      process.execPath,
-      expect.any(Array),
-      expect.objectContaining({ stdio: ["pipe", "pipe", "inherit"] }),
-    );
+    expect(bridgeState.request).toHaveBeenCalledWith({
+      domain: "plugin-state",
+      payload: {
+        config,
+        env,
+        request: { operation: "lookupRaw", scope, key: "thread:1" },
+      },
+    });
   });
 
-  it("restores typed plugin-state failures from the process", () => {
-    childState.result.stdout = JSON.stringify({
-      ok: false,
-      error: {
+  it("restores typed plugin-state failures from the worker", () => {
+    bridgeState.request.mockImplementation(() => {
+      throw new StorageSyncBridgeRemoteError({
         name: "PluginStateStoreError",
         message: "capacity reached",
         code: "PLUGIN_STATE_LIMIT_EXCEEDED",
         operation: "register",
-      },
+      });
     });
 
     const bridge = new AzureSqlPluginStateSyncBridge(config, {}, scope);
@@ -88,18 +88,32 @@ describe("AzureSqlPluginStateSyncBridge", () => {
     );
   });
 
-  it("fails immediately when the bridge process cannot start", () => {
-    childState.result = {
-      pid: 0,
-      output: [],
-      stdout: "",
-      stderr: "",
-      status: null,
-      signal: null,
-      error: new Error("spawn failed"),
-    };
+  it("preserves ambiguous write timeouts as visible write failures", () => {
+    bridgeState.request.mockImplementation(() => {
+      throw new StorageSyncBridgeTimeoutError("commit outcome is unknown");
+    });
 
     const bridge = new AzureSqlPluginStateSyncBridge(config, {}, scope);
-    expect(() => bridge.lookup("thread:1")).toThrow("bridge process failed");
+    expect(() => bridge.register({ key: "thread:1", valueJson: "{}" })).toThrow(
+      expect.objectContaining({
+        message: "commit outcome is unknown",
+        code: "PLUGIN_STATE_WRITE_FAILED",
+        operation: "register",
+      }),
+    );
+  });
+
+  it("maps mailbox lifecycle failures to plugin-state open failures", () => {
+    bridgeState.request.mockImplementation(() => {
+      throw new Error("worker failed");
+    });
+
+    const bridge = new AzureSqlPluginStateSyncBridge(config, {}, scope);
+    expect(() => bridge.lookup("thread:1")).toThrow(
+      expect.objectContaining({
+        code: "PLUGIN_STATE_OPEN_FAILED",
+        operation: "open",
+      }),
+    );
   });
 });

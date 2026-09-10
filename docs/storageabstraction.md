@@ -31,7 +31,7 @@ Local filesystem remains the owner of workspaces and named artifacts.
 
 The abstraction is a compatibility boundary, not a fake implementation of `node:sqlite`. Azure SQL is asynchronous and networked; it must not expose `DatabaseSync` or `StatementSync` as backend contracts.
 
-During the plugin-state migration only, existing trusted synchronous keyed-store callers use an internal blocking worker bridge. The worker executes the canonical asynchronous Azure SQL operations and returns only after the operation succeeds or fails; it does not cache reads, queue deferred writes, or weaken durability. This compatibility path is not a new public SDK capability, must not gain new callers, and is removed after bundled and core plugin-state clients migrate to the asynchronous API.
+Named trusted synchronous storage callers may temporarily use the internal single-flight blocking worker mailbox. The worker executes only closed, domain-owned asynchronous operation protocols, reuses its Azure SQL pools, and returns only after an operation succeeds or fails; it does not cache reads, queue deferred writes, expose generic RPC, or weaken durability. The approved initial consumers are plugin state and the task-lifecycle transaction cohort. This compatibility path is not a public SDK capability, new storage surfaces remain async by default, and each consumer requires an explicit removal plan.
 
 ## Goals
 
@@ -1330,6 +1330,8 @@ Implemented surfaces:
 - `src/storage/migrations/project-registry.ts` provides the stopped-writer project-registry copy contract.
 - `src/storage/azure-sql/plugin-state-store.ts` implements asynchronous plugin-state operations, conditional writes, bounded imports, and Doctor-owned compare-and-delete repair.
 - `src/storage/plugin-state-store-factory.ts` selects and retains the Azure SQL plugin-state backend owner.
+- `src/storage/storage-sync-bridge.ts` and its worker provide the approved single-flight compatibility mailbox, with plugin state as the first consumer and task lifecycle planned as the second.
+- `src/storage/task-cohort-store.ts` defines the canonical asynchronous task transaction-cohort contract; its SQLite adapter and runtime routing are not yet implemented.
 - `src/infra/state-migrations.plugin-state.ts` imports a stopped legacy SQLite plugin-state sidecar into the selected backend, preserves absolute timestamps, and archives the source only after every row is reconciled.
 
 The Azure SQL schema uses explicit binary collation and fixed-size hashes for long path, URL, and plugin-state lookup keys. Lease expiry is computed by Azure SQL; process-local lease deadlines are conservative and cannot outlive the database lease. Secret-backed authentication is resolved at the runtime boundary, and SQL passwords must be configured through `SecretRef`.
@@ -1357,7 +1359,7 @@ The migration remains incremental:
 - Backend selection must not imply that stores outside the migrated slices have moved.
 - SQLite remains the supported default and regression reference.
 
-The next bounded store is the task registry. It must retain its current transaction, authority, retention, recovery, and operator-visible failure contracts.
+The next bounded store is the task registry. It must retain its current transaction, authority, retention, recovery, and operator-visible failure contracts. The living investigation, implementation, and evidence record is the [task registry vertical notebook](/storageabstraction_tasks).
 
 ## Sanitized live Azure SQL proof
 

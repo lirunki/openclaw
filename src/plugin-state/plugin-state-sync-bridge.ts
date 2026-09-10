@@ -1,27 +1,67 @@
-import { spawnSync } from "node:child_process";
 import type { Result } from "@openclaw/normalization-core/result";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { runtimeProcessEntrypoints } from "../infra/runtime-process-entrypoints.js";
-import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import type {
   AzureSqlPluginStateRawEntry,
   AzureSqlPluginStateRegisterInput,
   AzureSqlPluginStateScope,
 } from "../storage/azure-sql/plugin-state-store.js";
-import { PluginStateStoreError, type PluginStateEntry } from "./plugin-state-store.types.js";
+import type { SerializedStorageSyncBridgeError } from "../storage/storage-sync-bridge-protocol.js";
+import {
+  closeStorageSyncBridge,
+  requestStorageSyncBridge,
+  StorageSyncBridgeRemoteError,
+  StorageSyncBridgeTimeoutError,
+} from "../storage/storage-sync-bridge.js";
+import {
+  PluginStateStoreError,
+  type PluginStateEntry,
+  type PluginStateStoreErrorCode,
+  type PluginStateStoreOperation,
+} from "./plugin-state-store.types.js";
 import type {
-  PluginStateBridgeError,
+  PluginStateBridgeEnvelope,
   PluginStateBridgeLookupResult,
   PluginStateBridgeRequest,
-  PluginStateBridgeResponse,
 } from "./plugin-state-sync-bridge.shared.js";
 
-const BRIDGE_TIMEOUT_MS = 300_000;
-const BRIDGE_MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
 const UPDATE_RETRY_LIMIT = 100;
 
-function restoreError(error: PluginStateBridgeError): Error {
-  if (error.code && error.operation) {
+function isPluginStateErrorCode(value: string): value is PluginStateStoreErrorCode {
+  return [
+    "PLUGIN_STATE_SQLITE_UNAVAILABLE",
+    "PLUGIN_STATE_OPEN_FAILED",
+    "PLUGIN_STATE_WRITE_FAILED",
+    "PLUGIN_STATE_READ_FAILED",
+    "PLUGIN_STATE_CORRUPT",
+    "PLUGIN_STATE_LIMIT_EXCEEDED",
+    "PLUGIN_STATE_INVALID_INPUT",
+  ].includes(value);
+}
+
+function isPluginStateOperation(value: string): value is PluginStateStoreOperation {
+  return [
+    "load-sqlite",
+    "open",
+    "ensure-schema",
+    "register",
+    "lookup",
+    "consume",
+    "delete",
+    "entries",
+    "clear",
+    "sweep",
+    "probe",
+    "close",
+  ].includes(value);
+}
+
+function restoreError(error: SerializedStorageSyncBridgeError): Error {
+  if (
+    error.code &&
+    error.operation &&
+    isPluginStateErrorCode(error.code) &&
+    isPluginStateOperation(error.operation)
+  ) {
     return new PluginStateStoreError(error.message, {
       code: error.code,
       operation: error.operation,
@@ -32,22 +72,34 @@ function restoreError(error: PluginStateBridgeError): Error {
   return restored;
 }
 
-function parseResponse(raw: string): Extract<PluginStateBridgeResponse, { ok: true }> {
-  let response: PluginStateBridgeResponse;
-  try {
-    // SAFETY: the bridge subprocess emits exactly one JSON protocol response on stdout.
-    response = JSON.parse(raw) as PluginStateBridgeResponse;
-  } catch (error) {
-    throw new PluginStateStoreError("Azure SQL plugin-state bridge returned an invalid response.", {
-      code: "PLUGIN_STATE_OPEN_FAILED",
-      operation: "open",
-      cause: error,
-    });
+function timeoutFailureForRequest(request: PluginStateBridgeRequest): {
+  code: PluginStateStoreErrorCode;
+  operation: PluginStateStoreOperation;
+} {
+  switch (request.operation) {
+    case "lookupRaw":
+    case "lookupMany":
+      return { code: "PLUGIN_STATE_READ_FAILED", operation: "lookup" };
+    case "entriesInKeyRange":
+    case "entries":
+    case "countLiveEntries":
+      return { code: "PLUGIN_STATE_READ_FAILED", operation: "entries" };
+    case "consume":
+      return { code: "PLUGIN_STATE_WRITE_FAILED", operation: "consume" };
+    case "delete":
+    case "deleteIfUnchanged":
+      return { code: "PLUGIN_STATE_WRITE_FAILED", operation: "delete" };
+    case "clear":
+      return { code: "PLUGIN_STATE_WRITE_FAILED", operation: "clear" };
+    case "sweepExpired":
+      return { code: "PLUGIN_STATE_WRITE_FAILED", operation: "sweep" };
+    case "register":
+    case "registerIfAbsent":
+    case "importBatch":
+    case "appendSequencedJournalEntry":
+    case "compareAndSet":
+      return { code: "PLUGIN_STATE_WRITE_FAILED", operation: "register" };
   }
-  if (!response.ok) {
-    throw restoreError(response.error);
-  }
-  return response;
 }
 
 function parseRaw<T>(raw: AzureSqlPluginStateRawEntry, operation: "lookup" | "consume"): T {
@@ -71,25 +123,31 @@ export class AzureSqlPluginStateSyncBridge {
   ) {}
 
   private request<T>(request: PluginStateBridgeRequest): T {
-    const workerUrl = resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.pluginStateSyncBridge);
-    const child = spawnSync(process.execPath, resolveRuntimeWorkerArgv(workerUrl), {
-      input: JSON.stringify({ config: this.config, env: this.env, request }),
-      encoding: "utf8",
-      maxBuffer: BRIDGE_MAX_OUTPUT_BYTES,
-      timeout: BRIDGE_TIMEOUT_MS,
-      windowsHide: true,
-      // Device-code authentication publishes its operator prompt on stderr.
-      stdio: ["pipe", "pipe", "inherit"],
-    });
-    if (child.error || child.status !== 0) {
-      throw new PluginStateStoreError("Azure SQL plugin-state bridge process failed.", {
+    try {
+      return requestStorageSyncBridge<T>({
+        domain: "plugin-state",
+        payload: {
+          config: this.config,
+          env: this.env,
+          request,
+        } satisfies PluginStateBridgeEnvelope,
+      });
+    } catch (error) {
+      if (error instanceof StorageSyncBridgeRemoteError) {
+        throw restoreError(error.remote);
+      }
+      if (error instanceof StorageSyncBridgeTimeoutError) {
+        throw new PluginStateStoreError(error.message, {
+          ...timeoutFailureForRequest(request),
+          cause: error,
+        });
+      }
+      throw new PluginStateStoreError("Azure SQL plugin-state bridge worker failed.", {
         code: "PLUGIN_STATE_OPEN_FAILED",
         operation: "open",
-        cause: child.error,
+        cause: error,
       });
     }
-    // SAFETY: each request fixes its response type at the bridge call site.
-    return parseResponse(child.stdout).value as T;
   }
 
   register(input: AzureSqlPluginStateRegisterInput): void {
@@ -266,5 +324,5 @@ export class AzureSqlPluginStateSyncBridge {
 }
 
 export async function closePluginStateSyncBridgeWorker(): Promise<void> {
-  // Each compatibility call owns and joins its subprocess before returning.
+  await closeStorageSyncBridge();
 }

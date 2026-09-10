@@ -1,33 +1,62 @@
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { SecretRef } from "../config/types.secrets.js";
+import { resolveSecretRefString } from "../secrets/resolve.js";
+import type { AzureSqlPluginStateStore } from "../storage/azure-sql/plugin-state-store.js";
 import { resolvePluginStateRuntimeOptions } from "../storage/plugin-state-runtime-options.js";
 import {
   closePluginStateAzureSqlDatabases,
   createAzureSqlPluginStateStore,
 } from "../storage/plugin-state-store-factory.js";
+import { serializeStorageSyncBridgeError } from "../storage/storage-sync-bridge-protocol.js";
 import { PluginStateStoreError } from "./plugin-state-store.types.js";
 import type {
   PluginStateBridgeEnvelope,
   PluginStateBridgeError,
-  PluginStateBridgeResponse,
+  PluginStateBridgeLookupResult,
 } from "./plugin-state-sync-bridge.shared.js";
 
-function serializeError(error: unknown): PluginStateBridgeError {
-  if (error instanceof PluginStateStoreError) {
-    return {
-      name: error.name,
-      message: error.message,
-      code: error.code,
-      operation: error.operation,
-    };
+let activeStore: AzureSqlPluginStateStore | undefined;
+let currentSecretContext: { config: OpenClawConfig; env: NodeJS.ProcessEnv } | undefined;
+
+const resolveCurrentSecret = async (ref: SecretRef): Promise<string> => {
+  if (!currentSecretContext) {
+    throw new Error("Plugin-state compatibility worker secret context is unavailable");
   }
+  return await resolveSecretRefString(ref, currentSecretContext);
+};
+
+function serializePluginStateError(error: unknown): PluginStateBridgeError {
+  const serialized = serializeStorageSyncBridgeError(error);
   return {
-    name: error instanceof Error ? error.name : "Error",
-    message: error instanceof Error ? error.message : String(error),
+    name: serialized.name,
+    message: serialized.message,
+    ...(error instanceof PluginStateStoreError
+      ? { code: error.code, operation: error.operation }
+      : {}),
   };
 }
 
-async function handleRequest(envelope: PluginStateBridgeEnvelope): Promise<unknown> {
+async function resolveStore(
+  envelope: PluginStateBridgeEnvelope,
+): Promise<AzureSqlPluginStateStore> {
+  currentSecretContext = { config: envelope.config, env: envelope.env };
   const options = await resolvePluginStateRuntimeOptions(envelope.config, envelope.env);
-  const store = createAzureSqlPluginStateStore(options);
+  if (options.storage.azureSql?.credential) {
+    options.azureSqlSecretResolver = resolveCurrentSecret;
+  }
+  let store = createAzureSqlPluginStateStore(options);
+  if (activeStore && activeStore !== store) {
+    await closePluginStateAzureSqlDatabases();
+    store = createAzureSqlPluginStateStore(options);
+  }
+  activeStore = store;
+  return store;
+}
+
+export async function handlePluginStateSyncBridgeRequest(
+  envelope: PluginStateBridgeEnvelope,
+): Promise<unknown> {
+  const store = await resolveStore(envelope);
   const request = envelope.request;
   switch (request.operation) {
     case "register":
@@ -46,8 +75,8 @@ async function handleRequest(envelope: PluginStateBridgeEnvelope): Promise<unkno
       return await store.importBatch(request.scope, request.entries);
     case "lookupMany": {
       const results = await store.lookupMany(request.scope, request.keys);
-      return results.map((result) =>
-        result.ok ? result : { ok: false as const, error: serializeError(result.error) },
+      return results.map((result): PluginStateBridgeLookupResult =>
+        result.ok ? result : { ok: false, error: serializePluginStateError(result.error) },
       );
     }
     case "consume":
@@ -73,28 +102,8 @@ async function handleRequest(envelope: PluginStateBridgeEnvelope): Promise<unkno
   }
 }
 
-async function readInput(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-let response: PluginStateBridgeResponse;
-try {
-  const input = await readInput();
-  // SAFETY: the parent bridge is the only caller and validates the protocol before serialization.
-  const envelope = JSON.parse(input) as PluginStateBridgeEnvelope;
-  response = { ok: true, value: await handleRequest(envelope) };
-} catch (error) {
-  response = { ok: false, error: serializeError(error) };
-}
-try {
+export async function closePluginStateSyncBridgeHandler(): Promise<void> {
+  activeStore = undefined;
+  currentSecretContext = undefined;
   await closePluginStateAzureSqlDatabases();
-} catch (error) {
-  if (response.ok) {
-    response = { ok: false, error: serializeError(error) };
-  }
 }
-process.stdout.write(JSON.stringify(response));
