@@ -1578,6 +1578,10 @@ function buildLegacyStateMigrationSteps(
     kind: "sqlite",
     path: resolveOpenClawStateSqlitePath({ ...env, OPENCLAW_STATE_DIR: stateDir }),
   };
+  const pluginStateDatabase: LegacyStateMigrationEndpoint =
+    params.config.storage?.backend === "azuresql"
+      ? { kind: "owner", id: "storage:azuresql:plugin-state" }
+      : stateDatabase;
   const now = params.now ?? (() => Date.now());
   const isDoctor = params.mode === "doctor";
   const repairSessionFiles = isDoctor && !params.skipAgentScopedMigrations;
@@ -1668,6 +1672,7 @@ function buildLegacyStateMigrationSteps(
         ? [{ kind: "sqlite" as const, path: detected.pluginStateSidecar.sourcePath }]
         : [],
       detected.pluginStateSidecar.hasLegacy,
+      [pluginStateDatabase],
     ],
     "debug-proxy-capture": [
       pathEndpoints(
@@ -1897,14 +1902,11 @@ function buildLegacyStateMigrationSteps(
   const sharedSteps: LegacyStateMigrationStep[] = [
     ownerStep("shared-auth-store", detected.sharedAuthStore, migrateSharedAuthStore, "shared"),
     sharedStep("plugin-state-sidecar", () =>
-      params.config.storage?.backend === "azuresql"
-        ? Promise.resolve({
-            changes: [],
-            warnings: [
-              "Plugin-state sidecar migration is unavailable while Azure SQL is selected. The sidecar was retained; keep it until the offline SQLite-to-Azure plugin-state migrator is implemented.",
-            ],
-          })
-        : migrateLegacyPluginStateSidecar({ stateDir }),
+      migrateLegacyPluginStateSidecar({
+        stateDir,
+        config: params.config,
+        env: { ...env, OPENCLAW_STATE_DIR: stateDir },
+      }),
     ),
     ownerStep(
       "debug-proxy-capture",

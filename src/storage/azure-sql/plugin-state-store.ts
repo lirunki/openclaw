@@ -47,7 +47,22 @@ export type AzureSqlPluginStateRegisterInput = {
   createdAtMs?: number;
 };
 
+export type AzureSqlPluginStateImportInput = {
+  key: string;
+  valueJson: string;
+  createdAtMs: number;
+  expiresAtMs: number | null;
+};
+
+type AzureSqlPluginStateWriteInput =
+  | AzureSqlPluginStateRegisterInput
+  | AzureSqlPluginStateImportInput;
+
 export type AzureSqlPluginStateCasResult = "applied" | "conflict";
+
+export type AzureSqlPluginStateImportResult =
+  | { status: "inserted" }
+  | { status: "existing"; entry: AzureSqlPluginStateRawEntry };
 
 function pluginStateError(params: {
   code: PluginStateStoreErrorCode;
@@ -81,11 +96,14 @@ function bindScope(request: AzureSqlRequest, scope: AzureSqlPluginStateScope): v
 function bindEntry(
   request: AzureSqlRequest,
   scope: AzureSqlPluginStateScope,
-  input: AzureSqlPluginStateRegisterInput,
+  input: AzureSqlPluginStateWriteInput,
 ): void {
+  const ttlMs = "ttlMs" in input ? input.ttlMs : undefined;
+  const hasAbsoluteExpiry = "expiresAtMs" in input;
+  const expiresAtMs = hasAbsoluteExpiry ? input.expiresAtMs : undefined;
   if (
-    input.ttlMs !== undefined &&
-    resolveExpiresAtMsFromDurationMs(input.ttlMs, { nowMs: Date.now() }) === undefined
+    ttlMs !== undefined &&
+    resolveExpiresAtMsFromDurationMs(ttlMs, { nowMs: Date.now() }) === undefined
   ) {
     throw pluginStateError({
       code: "PLUGIN_STATE_INVALID_INPUT",
@@ -93,11 +111,24 @@ function bindEntry(
       message: "Plugin state ttlMs cannot produce a valid expiry timestamp.",
     });
   }
+  if (
+    expiresAtMs !== undefined &&
+    expiresAtMs !== null &&
+    (!Number.isSafeInteger(expiresAtMs) || expiresAtMs < 0)
+  ) {
+    throw pluginStateError({
+      code: "PLUGIN_STATE_INVALID_INPUT",
+      operation: "register",
+      message: "Plugin state expiresAtMs must be null or a non-negative safe integer.",
+    });
+  }
   bindScope(request, scope);
   request.input("entryKey", mssql.NVarChar(512), input.key);
   request.input("valueJson", mssql.NVarChar(mssql.MAX), input.valueJson);
-  request.input("ttlMs", mssql.BigInt(), input.ttlMs ?? null);
+  request.input("ttlMs", mssql.BigInt(), ttlMs ?? null);
   request.input("createdAtMs", mssql.BigInt(), input.createdAtMs ?? null);
+  request.input("expiresAtMs", mssql.BigInt(), expiresAtMs ?? null);
+  request.input("hasAbsoluteExpiry", mssql.Bit(), hasAbsoluteExpiry);
 }
 
 function normalizeInteger(value: number | string | null): number | null {
@@ -321,7 +352,7 @@ async function enforceLimits(
 async function writeEntry(
   transaction: AzureSqlTransaction,
   scope: AzureSqlPluginStateScope,
-  input: AzureSqlPluginStateRegisterInput,
+  input: AzureSqlPluginStateWriteInput,
 ): Promise<void> {
   await transaction.query(
     `DECLARE @now bigint = ${AZURE_SQL_NOW_MS};
@@ -335,7 +366,11 @@ async function writeEntry(
        FROM ${AZURE_SQL_PLUGIN_STATE_TABLE} WITH (UPDLOCK, HOLDLOCK)
        WHERE plugin_id = @pluginId AND namespace = @namespace;
      END;
-     DECLARE @expiresAt bigint = CASE WHEN @ttlMs IS NULL THEN NULL ELSE @now + @ttlMs END;
+     DECLARE @expiresAt bigint = CASE
+       WHEN @hasAbsoluteExpiry = 1 THEN @expiresAtMs
+       WHEN @ttlMs IS NULL THEN NULL
+       ELSE @now + @ttlMs
+     END;
      IF EXISTS (
        SELECT 1 FROM ${AZURE_SQL_PLUGIN_STATE_TABLE} WITH (UPDLOCK, HOLDLOCK)
        WHERE plugin_id = @pluginId AND namespace = @namespace
@@ -756,6 +791,36 @@ export class AzureSqlPluginStateStore {
     }
   }
 
+  async importIfAbsent(
+    scope: AzureSqlPluginStateScope,
+    input: AzureSqlPluginStateImportInput,
+  ): Promise<AzureSqlPluginStateImportResult> {
+    try {
+      return await this.write(
+        async () =>
+          await this.database.transaction(async (transaction) => {
+            await acquirePluginLock(transaction, scope.pluginId);
+            await deleteExpiredScope(transaction, scope);
+            const current = await selectRaw(transaction, scope, input.key, true);
+            if (current) {
+              return { status: "existing", entry: current };
+            }
+            await assertCanInsert(transaction, scope);
+            await writeEntry(transaction, scope, input);
+            await enforceLimits(transaction, scope, input.key);
+            return { status: "inserted" };
+          }),
+      );
+    } catch (error) {
+      throw wrapPluginStateError(
+        error,
+        "register",
+        "PLUGIN_STATE_WRITE_FAILED",
+        "Failed to import plugin state entry.",
+      );
+    }
+  }
+
   async importBatch(
     scope: AzureSqlPluginStateScope,
     entries: readonly AzureSqlPluginStateRegisterInput[],
@@ -864,6 +929,53 @@ export class AzureSqlPluginStateStore {
         "register",
         "PLUGIN_STATE_WRITE_FAILED",
         "Failed to update plugin state entry.",
+      );
+    }
+  }
+
+  async deleteEntriesIfUnchanged(
+    scope: AzureSqlPluginStateScope,
+    expectedEntries: readonly AzureSqlPluginStateRawEntry[],
+    assertRepairAuthority: () => void,
+  ): Promise<{ deleted: number; changed: number }> {
+    try {
+      return await this.write(
+        async () =>
+          await this.database.transaction(async (transaction) => {
+            await acquirePluginLock(transaction, scope.pluginId);
+            assertRepairAuthority();
+            let deleted = 0;
+            let changed = 0;
+            for (const expected of expectedEntries) {
+              const current = await selectRaw(transaction, scope, expected.key, true);
+              assertRepairAuthority();
+              if (!sameRaw(current, expected)) {
+                changed += 1;
+                continue;
+              }
+              const result = await transaction.query(
+                `DELETE FROM ${AZURE_SQL_PLUGIN_STATE_TABLE}
+                 WHERE plugin_id = @pluginId AND namespace = @namespace
+                   AND entry_key_hash = HASHBYTES('SHA2_256', CONVERT(varbinary(max), @entryKey))
+                   AND entry_key = @entryKey`,
+                (request) => {
+                  bindScope(request, scope);
+                  request.input("entryKey", mssql.NVarChar(512), expected.key);
+                },
+              );
+              deleted += result.rowsAffected.reduce((sum, value) => sum + value, 0);
+              assertRepairAuthority();
+            }
+            assertRepairAuthority();
+            return { deleted, changed };
+          }),
+      );
+    } catch (error) {
+      throw wrapPluginStateError(
+        error,
+        "delete",
+        "PLUGIN_STATE_WRITE_FAILED",
+        "Failed to delete plugin state entries during Doctor repair.",
       );
     }
   }

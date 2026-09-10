@@ -46,11 +46,16 @@ export type PluginDoctorStateMigrationContext = {
       | { agentId: string; sessionId: string; state: "absent" | "unknown" }
     )[]
   >;
-  /** Present only while the host owns the offline SQLite maintenance lock. */
+  /** Present only while the host owns offline SQLite maintenance authority. */
   deletePluginStateEntriesIfUnchanged?: (
     namespace: string,
     entries: readonly PluginDoctorRawStateEntry[],
   ) => { deleted: number; changed: number };
+  /** Async backend-neutral form for hosts whose storage transaction is asynchronous. */
+  deletePluginStateEntriesIfUnchangedAsync?: (
+    namespace: string,
+    entries: readonly PluginDoctorRawStateEntry[],
+  ) => Promise<{ deleted: number; changed: number }>;
   /** Owner-bound ingress queue access, one entry per manifest-declared channel;
    *  the host fixes the channel identity and doctor state directory. Older test
    *  hosts may omit it. */

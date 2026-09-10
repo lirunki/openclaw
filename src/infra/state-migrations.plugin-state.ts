@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ChannelLegacyStateMigrationPlan } from "../channels/plugins/types.core.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   countPluginStateLiveEntries,
   createPluginStateKeyedStore,
   registerMigratedPluginStateEntry,
   resolveMaxPluginStateEntriesPerPlugin,
 } from "../plugin-state/plugin-state-store.js";
+import { MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN } from "../plugin-state/plugin-state-store.types.js";
 import { inspectPersistedInstalledPluginIndexInstallRecordsSync } from "../plugins/installed-plugin-index-record-state.js";
 import { writePersistedInstalledPluginIndexSync } from "../plugins/installed-plugin-index-store-write.js";
 import {
@@ -15,6 +17,11 @@ import {
 } from "../plugins/installed-plugin-index-store.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
+import type {
+  AzureSqlPluginStateRawEntry,
+  AzureSqlPluginStateStore,
+} from "../storage/azure-sql/plugin-state-store.js";
+import { resolveStorageBackend } from "../storage/storage-backend.js";
 import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
@@ -41,8 +48,61 @@ import type { MigrationMessages } from "./state-migrations.types.js";
 
 type LegacyPluginStateImportDatabase = Pick<OpenClawStateKyselyDatabase, "plugin_state_entries">;
 
+function azurePluginStateRowsMatch(
+  existing: AzureSqlPluginStateRawEntry,
+  legacy: LegacyPluginStateSidecarRow,
+): boolean {
+  return (
+    existing.valueJson === legacy.value_json &&
+    existing.createdAt === (normalizeLegacySqliteInteger(legacy.created_at) ?? 0) &&
+    existing.expiresAt === normalizeLegacySqliteInteger(legacy.expires_at)
+  );
+}
+
+async function importLegacyPluginStateRowsToAzure(params: {
+  rows: readonly LegacyPluginStateSidecarRow[];
+  store: AzureSqlPluginStateStore;
+}): Promise<{ imported: number; skippedExpired: number; conflictedKeys: string[] }> {
+  const conflictedKeys: string[] = [];
+  let imported = 0;
+  let skippedExpired = 0;
+  const now = Date.now();
+  for (const row of params.rows) {
+    const createdAt = normalizeLegacySqliteInteger(row.created_at) ?? 0;
+    const expiresAt = normalizeLegacySqliteInteger(row.expires_at);
+    if (isLegacyPluginStateRowExpired(row, now)) {
+      skippedExpired += 1;
+      continue;
+    }
+    const result = await params.store.importIfAbsent(
+      {
+        pluginId: row.plugin_id,
+        namespace: row.namespace,
+        maxEntries: MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
+        overflowPolicy: "reject-new",
+      },
+      {
+        key: row.entry_key,
+        valueJson: row.value_json,
+        createdAtMs: createdAt,
+        expiresAtMs: expiresAt,
+      },
+    );
+    if (result.status === "inserted") {
+      imported += 1;
+      continue;
+    }
+    if (!azurePluginStateRowsMatch(result.entry, row) && result.entry.createdAt <= createdAt) {
+      conflictedKeys.push(`${row.plugin_id}/${row.namespace}/${row.entry_key}`);
+    }
+  }
+  return { imported, skippedExpired, conflictedKeys };
+}
+
 export async function migrateLegacyPluginStateSidecar(params: {
   stateDir: string;
+  config?: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
 }): Promise<{ changes: string[]; warnings: string[] }> {
   const sourcePath = resolveLegacyPluginStateSidecarPath(params.stateDir);
   if (!migrationFileExists(sourcePath)) {
@@ -67,6 +127,40 @@ export async function migrateLegacyPluginStateSidecar(params: {
   }
 
   try {
+    if (params.config && resolveStorageBackend(params.config) === "azuresql") {
+      const [{ createAzureSqlPluginStateStore }, { resolvePluginStateRuntimeOptions }] =
+        await Promise.all([
+          import("../storage/plugin-state-store-factory.js"),
+          import("../storage/plugin-state-runtime-options.js"),
+        ]);
+      const store = createAzureSqlPluginStateStore(
+        await resolvePluginStateRuntimeOptions(params.config, params.env ?? process.env),
+      );
+      const { imported, skippedExpired, conflictedKeys } = await importLegacyPluginStateRowsToAzure(
+        { rows, store },
+      );
+      if (imported > 0) {
+        changes.push(
+          `Migrated ${imported} plugin-state sidecar ${imported === 1 ? "entry" : "entries"} → Azure SQL`,
+        );
+      }
+      if (conflictedKeys.length > 0) {
+        return {
+          changes,
+          warnings: [
+            `Left plugin-state sidecar in place because ${conflictedKeys.length} ${conflictedKeys.length === 1 ? "row differs" : "rows differ"} from Azure SQL without a newer canonical timestamp. First key: ${conflictedKeys[0]}`,
+          ],
+        };
+      }
+      if (skippedExpired > 0) {
+        changes.push(
+          `Dropped ${skippedExpired} expired plugin-state sidecar ${skippedExpired === 1 ? "entry" : "entries"}`,
+        );
+      }
+      archiveLegacyPluginStateSidecar({ sourcePath, changes, warnings });
+      return { changes, warnings };
+    }
+
     const conflictedKeys: string[] = [];
     const rowsToInsert: LegacyPluginStateSidecarRow[] = [];
     let imported = 0;

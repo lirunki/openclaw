@@ -193,6 +193,31 @@ describe("plugin doctor session identity evidence", () => {
     );
   });
 
+  it("keeps the synchronous delete callback SQLite-only and exposes async repair for Azure SQL", async () => {
+    await withOpenClawTestState(
+      { label: "plugin-doctor-azure-repair-contract", applyEnv: false },
+      async ({ env }) => {
+        const context = createPluginDoctorStateMigrationContext({
+          pluginId: "codex",
+          env,
+          config: {
+            storage: {
+              backend: "azuresql",
+              azureSql: { server: "sql.example.invalid", database: "openclaw" },
+            },
+          },
+          repairAuthority: {
+            assertCurrent() {},
+            assertOwnedInTransaction() {},
+          },
+        });
+
+        expect(context.deletePluginStateEntriesIfUnchanged).toBeUndefined();
+        expect(context.deletePluginStateEntriesIfUnchangedAsync).toBeTypeOf("function");
+      },
+    );
+  });
+
   it("rejects retained destructive repair callbacks after their owner expires", async () => {
     await withOpenClawTestState(
       { label: "plugin-doctor-expired-repair", applyEnv: false },

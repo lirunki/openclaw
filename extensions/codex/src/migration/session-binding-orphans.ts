@@ -150,17 +150,19 @@ export const codexOrphanedSessionBindingMigration: PluginDoctorStateMigration = 
     return null;
   },
   async migrateLegacyState(params) {
-    const remove = params.context.deletePluginStateEntriesIfUnchanged;
+    const remove =
+      params.context.deletePluginStateEntriesIfUnchangedAsync ??
+      params.context.deletePluginStateEntriesIfUnchanged;
     if (!remove) {
       return {
         changes: [],
-        warnings: ["Codex session binding repair requires locked SQLite maintenance ownership"],
+        warnings: ["Codex session binding repair requires offline maintenance ownership"],
       };
     }
     let deleted = 0;
     let changed = 0;
     for await (const rows of iterateOrphanBindingPages(params)) {
-      const result = remove(CODEX_APP_SERVER_BINDING_NAMESPACE, rows);
+      const result = await remove(CODEX_APP_SERVER_BINDING_NAMESPACE, rows);
       deleted += result.deleted;
       changed += result.changed;
     }

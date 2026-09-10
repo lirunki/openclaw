@@ -120,6 +120,158 @@ describe("AzureSqlPluginStateStore", () => {
     );
   });
 
+  it("deletes only unchanged Doctor rows after revalidating repair authority", async () => {
+    const database = new FakePluginStateDatabase();
+    database.handler = (sql, values) => {
+      if (sql.includes("SELECT entry_key") && sql.includes("UPDLOCK")) {
+        const key = values.get("entryKey");
+        return result([
+          {
+            entry_key: key,
+            value_json: key === "changed" ? '{"generation":2}' : '{"generation":1}',
+            created_at_ms: key === "changed" ? 20 : 10,
+            expires_at_ms: null,
+          },
+        ]);
+      }
+      if (sql.includes("DELETE FROM [openclaw_global].[plugin_state_entries]")) {
+        return result([], [1]);
+      }
+      return result();
+    };
+    const assertions: string[] = [];
+    const expected = (key: string) => ({
+      key,
+      valueJson: '{"generation":1}',
+      createdAt: 10,
+      expiresAt: null,
+    });
+
+    await expect(
+      createStore(database).deleteEntriesIfUnchanged(
+        scope,
+        [expected("unchanged"), expected("changed")],
+        () => assertions.push(database.sql.at(-1) ?? ""),
+      ),
+    ).resolves.toEqual({ deleted: 1, changed: 1 });
+
+    expect(assertions).toHaveLength(5);
+    expect(assertions[0]).toContain("sp_getapplock");
+    expect(
+      database.sql.filter((sql) => sql.includes("DELETE FROM") && sql.includes("entry_key_hash =")),
+    ).toHaveLength(1);
+  });
+
+  it("does not delete after Doctor repair authority expires during comparison", async () => {
+    const database = new FakePluginStateDatabase();
+    database.handler = (sql) =>
+      sql.includes("SELECT entry_key") && sql.includes("UPDLOCK")
+        ? result([
+            {
+              entry_key: "binding",
+              value_json: '{"generation":1}',
+              created_at_ms: 10,
+              expires_at_ms: null,
+            },
+          ])
+        : result();
+    let assertions = 0;
+
+    await expect(
+      createStore(database).deleteEntriesIfUnchanged(
+        scope,
+        [
+          {
+            key: "binding",
+            valueJson: '{"generation":1}',
+            createdAt: 10,
+            expiresAt: null,
+          },
+        ],
+        () => {
+          assertions += 1;
+          if (assertions === 2) {
+            throw new Error("repair authority expired");
+          }
+        },
+      ),
+    ).rejects.toThrow("Failed to delete plugin state entries during Doctor repair");
+
+    expect(
+      database.sql.some((sql) => sql.includes("DELETE FROM") && sql.includes("entry_key_hash =")),
+    ).toBe(false);
+  });
+
+  it("revalidates Doctor repair authority after an awaited delete", async () => {
+    const database = new FakePluginStateDatabase();
+    database.handler = (sql) =>
+      sql.includes("SELECT entry_key") && sql.includes("UPDLOCK")
+        ? result([
+            {
+              entry_key: "binding",
+              value_json: '{"generation":1}',
+              created_at_ms: 10,
+              expires_at_ms: null,
+            },
+          ])
+        : result([], [1]);
+    let assertions = 0;
+
+    await expect(
+      createStore(database).deleteEntriesIfUnchanged(
+        scope,
+        [
+          {
+            key: "binding",
+            valueJson: '{"generation":1}',
+            createdAt: 10,
+            expiresAt: null,
+          },
+        ],
+        () => {
+          assertions += 1;
+          if (assertions === 3) {
+            throw new Error("repair authority expired after delete");
+          }
+        },
+      ),
+    ).rejects.toThrow("Failed to delete plugin state entries during Doctor repair");
+
+    expect(
+      database.sql.some((sql) => sql.includes("DELETE FROM") && sql.includes("entry_key_hash =")),
+    ).toBe(true);
+  });
+
+  it("preserves an absolute expiry when importing a missing legacy row", async () => {
+    const database = new FakePluginStateDatabase();
+    let insertedValues: ReadonlyMap<string, unknown> | undefined;
+    database.handler = (sql, values) => {
+      if (sql.includes("SELECT entry_key") && sql.includes("UPDLOCK")) {
+        return result();
+      }
+      if (sql.includes("INSERT INTO [openclaw_global].[plugin_state_entries]")) {
+        insertedValues = values;
+      }
+      if (sql.includes("COUNT_BIG")) {
+        return result([{ entry_count: 0 }]);
+      }
+      return result([], [1]);
+    };
+
+    await expect(
+      createStore(database).importIfAbsent(scope, {
+        key: "legacy",
+        valueJson: '{"source":true}',
+        createdAtMs: 42,
+        expiresAtMs: 123_456,
+      }),
+    ).resolves.toEqual({ status: "inserted" });
+
+    expect(insertedValues?.get("createdAtMs")).toBe(42);
+    expect(insertedValues?.get("expiresAtMs")).toBe(123_456);
+    expect(insertedValues?.get("hasAbsoluteExpiry")).toBe(true);
+  });
+
   it("updates under one locked transaction and preserves the namespace policy", async () => {
     const database = new FakePluginStateDatabase();
     const counts = [1, 1];

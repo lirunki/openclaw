@@ -1317,7 +1317,7 @@ The implementation may proceed autonomously through discovery, design refinement
 
 ## Execution status
 
-**Status:** Phase 0 decisions are approved. The project-registry vertical slice is implemented for local review, with SQLite remaining the default backend.
+**Status:** Phase 0 decisions are approved. The project-registry and plugin-state vertical slices are implemented for local review, with SQLite remaining the default backend.
 
 Implemented surfaces:
 
@@ -1327,11 +1327,14 @@ Implemented surfaces:
 - `src/storage/azure-sql/migrations.ts` owns locked, checksummed Azure SQL migrations.
 - `src/storage/azure-sql/project-registry-store.ts` implements project rows and checkout leases.
 - `src/storage/project-registry-store-factory.ts` selects and retains the process-stable backend owner.
-- `src/storage/migrations/project-registry.ts` provides the stopped-writer first-slice copy contract.
+- `src/storage/migrations/project-registry.ts` provides the stopped-writer project-registry copy contract.
+- `src/storage/azure-sql/plugin-state-store.ts` implements asynchronous plugin-state operations, conditional writes, bounded imports, and Doctor-owned compare-and-delete repair.
+- `src/storage/plugin-state-store-factory.ts` selects and retains the Azure SQL plugin-state backend owner.
+- `src/infra/state-migrations.plugin-state.ts` imports a stopped legacy SQLite plugin-state sidecar into the selected backend, preserves absolute timestamps, and archives the source only after every row is reconciled.
 
-The Azure SQL schema uses explicit binary collation and fixed-size hashes for long path and URL lookup keys. Lease expiry is computed by Azure SQL; process-local lease deadlines are conservative and cannot outlive the database lease. Secret-backed authentication is resolved at the runtime boundary, and SQL passwords must be configured through `SecretRef`.
+The Azure SQL schema uses explicit binary collation and fixed-size hashes for long path, URL, and plugin-state lookup keys. Lease expiry is computed by Azure SQL; process-local lease deadlines are conservative and cannot outlive the database lease. Secret-backed authentication is resolved at the runtime boundary, and SQL passwords must be configured through `SecretRef`.
 
-Local tests cover configuration validation, credential resolution, pool and transaction behavior, migration locking and drift, SQLite compatibility, Azure project operations, checkout leases, first-slice migration conflicts, Gateway project flows, worktree authorization, setup preservation, and shutdown cleanup.
+Local tests cover configuration validation, credential resolution, pool and transaction behavior, migration locking and drift, SQLite compatibility, Azure project and plugin-state operations, checkout leases, migration conflicts, authority-safe Doctor repair, Gateway project flows, worktree authorization, setup preservation, and shutdown cleanup.
 
 ## Dependency preflight
 
@@ -1345,15 +1348,16 @@ The implementation keeps driver types inside the Azure SQL backend. No Azure res
 
 ## Current boundaries
 
-This remains a first vertical slice:
+The migration remains incremental:
 
-- Only the project registry and its checkout lease are implemented for Azure SQL.
+- Only the project registry, its checkout lease, and plugin state are implemented for Azure SQL.
+- Doctor can import the retired plugin-state SQLite sidecar into Azure SQL and can conditionally remove unchanged plugin rows while revalidating its maintenance authority inside the Azure mutation transaction.
 - Sessions, transcripts, memory, cron, audit, task, delivery, and other stores remain with their existing SQLite owners.
-- Backend-aware Doctor, backup, status, and the complete offline migration command remain pending.
-- Backend selection must not imply that stores outside the migrated slice have moved.
+- Backend-aware backup, status, and the complete multi-store offline migration command remain pending.
+- Backend selection must not imply that stores outside the migrated slices have moved.
 - SQLite remains the supported default and regression reference.
 
-The next implementation step is to complete review and local validation of this slice, then choose the next bounded store according to the phase order above. Each later store must retain its current transaction, authority, retention, recovery, and operator-visible failure contracts.
+The next bounded store is the task registry. It must retain its current transaction, authority, retention, recovery, and operator-visible failure contracts.
 
 ## Sanitized live Azure SQL proof
 

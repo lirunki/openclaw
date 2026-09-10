@@ -66,6 +66,22 @@ const backend = vi.hoisted(() => {
       async clear() {
         values.clear();
       },
+      async deleteEntriesIfUnchanged(
+        _scope: unknown,
+        entries: ReadonlyArray<{ key: string; valueJson: string }>,
+        assertCurrent: () => void,
+      ) {
+        assertCurrent();
+        let deleted = 0;
+        for (const entry of entries) {
+          assertCurrent();
+          if (values.get(entry.key) === entry.valueJson) {
+            values.delete(entry.key);
+            deleted += 1;
+          }
+        }
+        return { deleted, changed: entries.length - deleted };
+      },
     },
   };
 });
@@ -81,6 +97,7 @@ vi.mock("../storage/plugin-state-runtime-options.js", () => ({
 
 import {
   createPluginStateKeyedStoreForRuntime,
+  pluginStateDeleteEntriesIfUnchangedAsync,
   resetPluginStateStoreForTests,
 } from "./plugin-state-store.js";
 
@@ -99,6 +116,48 @@ afterEach(() => {
 });
 
 describe("Azure SQL plugin-state routing", () => {
+  it("routes Doctor conditional deletion through the Azure adapter", async () => {
+    backend.values.set("unchanged", '{"generation":1}');
+    backend.values.set("changed", '{"generation":2}');
+    let authorityChecks = 0;
+
+    await expect(
+      pluginStateDeleteEntriesIfUnchangedAsync(
+        {
+          pluginId: "discord",
+          namespace: "bindings",
+          entries: [
+            {
+              key: "unchanged",
+              valueJson: '{"generation":1}',
+              value: { generation: 1 },
+              createdAt: 1,
+              expiresAt: null,
+            },
+            {
+              key: "changed",
+              valueJson: '{"generation":1}',
+              value: { generation: 1 },
+              createdAt: 1,
+              expiresAt: null,
+            },
+          ],
+          assertCurrent: () => {
+            authorityChecks += 1;
+          },
+          assertOwnedInTransaction: () => {
+            throw new Error("Azure repair must not use a SQLite transaction assertion");
+          },
+        },
+        runtimeContext.config,
+      ),
+    ).resolves.toEqual({ deleted: 1, changed: 1 });
+
+    expect(authorityChecks).toBe(3);
+    expect(backend.values.has("unchanged")).toBe(false);
+    expect(backend.values.has("changed")).toBe(true);
+  });
+
   it("routes the async keyed-store contract through the Azure adapter", async () => {
     const store = createPluginStateKeyedStoreForRuntime<{ count: number }>(
       "discord",

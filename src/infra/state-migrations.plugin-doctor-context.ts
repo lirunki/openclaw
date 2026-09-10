@@ -21,8 +21,10 @@ import {
   getPluginStateCapacity,
   importPluginStateEntriesForDoctor,
   pluginStateDeleteEntriesIfUnchanged,
+  pluginStateDeleteEntriesIfUnchangedAsync,
   pluginStateDoctorEntriesInKeyRange,
   type OpenKeyedStoreOptions,
+  type PluginDoctorRawStateEntry,
 } from "../plugin-state/plugin-state-store.js";
 import type {
   PluginDoctorChannelIngressQueueAccess,
@@ -30,6 +32,7 @@ import type {
   PluginDoctorStateMigrationContext,
 } from "../plugins/doctor-contract-module.js";
 import { normalizeAgentId } from "../routing/session-key.js";
+import { resolveStorageBackend } from "../storage/storage-backend.js";
 import type { PluginDoctorRepairAuthority } from "./state-migrations.types.js";
 
 type SessionEvidenceResult = Awaited<
@@ -321,15 +324,27 @@ export function createPluginDoctorStateMigrationContext(params: {
     const authority = params.repairAuthority;
     context.updateAcpSessionIdentity = (input) =>
       updateAcpSessionIdentityForDoctor(params, authority, input);
-    context.deletePluginStateEntriesIfUnchanged = (namespace, entries) => {
+    const deleteParams = (namespace: string, entries: readonly PluginDoctorRawStateEntry[]) => ({
+      pluginId,
+      namespace,
+      entries,
+      env,
+      assertOwnedInTransaction: (
+        database: Parameters<typeof authority.assertOwnedInTransaction>[0],
+      ) => authority.assertOwnedInTransaction(database),
+    });
+    if (resolveStorageBackend(params.config) === "sqlite") {
+      context.deletePluginStateEntriesIfUnchanged = (namespace, entries) => {
+        authority.assertCurrent();
+        return pluginStateDeleteEntriesIfUnchanged(deleteParams(namespace, entries));
+      };
+    }
+    context.deletePluginStateEntriesIfUnchangedAsync = async (namespace, entries) => {
       authority.assertCurrent();
-      return pluginStateDeleteEntriesIfUnchanged(
+      return await pluginStateDeleteEntriesIfUnchangedAsync(
         {
-          pluginId,
-          namespace,
-          entries,
-          env,
-          assertOwnedInTransaction: (database) => authority.assertOwnedInTransaction(database),
+          ...deleteParams(namespace, entries),
+          assertCurrent: () => authority.assertCurrent(),
         },
         params.config,
       );

@@ -986,25 +986,57 @@ export function sweepExpiredPluginStateEntries(): number {
   return bridge ? bridge.sweepExpired() : sweepExpiredPluginStateEntriesSqlite();
 }
 
-export function pluginStateDeleteEntriesIfUnchanged(
-  params: {
-    pluginId: string;
-    namespace: string;
-    entries: readonly PluginDoctorRawStateEntry[];
-    assertOwnedInTransaction: Parameters<
-      typeof pluginStateDeleteEntriesIfUnchangedSqlite
-    >[0]["assertOwnedInTransaction"];
-    env?: NodeJS.ProcessEnv;
-  },
+type PluginStateDoctorDeleteParams = {
+  pluginId: string;
+  namespace: string;
+  entries: readonly PluginDoctorRawStateEntry[];
+  assertOwnedInTransaction: Parameters<
+    typeof pluginStateDeleteEntriesIfUnchangedSqlite
+  >[0]["assertOwnedInTransaction"];
+  env?: NodeJS.ProcessEnv;
+};
+
+export function pluginStateDeleteEntriesIfUnchanged(params: PluginStateDoctorDeleteParams): {
+  deleted: number;
+  changed: number;
+} {
+  return pluginStateDeleteEntriesIfUnchangedSqlite(params);
+}
+
+export async function pluginStateDeleteEntriesIfUnchangedAsync(
+  params: PluginStateDoctorDeleteParams & { assertCurrent: () => void },
   runtimeConfig?: DeepReadonly<OpenClawConfig>,
-): { deleted: number; changed: number } {
-  if (createAzureSqlAdminBridge(params, runtimeConfig)) {
-    throw new PluginStateStoreError(
-      "Azure SQL plugin-state repair deletion is unavailable until Doctor owns Azure transaction authority.",
-      { code: "PLUGIN_STATE_WRITE_FAILED", operation: "delete" },
+): Promise<{ deleted: number; changed: number }> {
+  if (params.entries.length > MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES) {
+    throw new RangeError(
+      `Plugin state bulk deletion cannot exceed ${MAX_PLUGIN_STATE_BULK_DELETE_ENTRIES} entries.`,
     );
   }
-  return pluginStateDeleteEntriesIfUnchangedSqlite(params);
+  if (params.entries.length === 0) {
+    return { deleted: 0, changed: 0 };
+  }
+  const config = resolvePluginStateConfig(runtimeConfig ? { config: runtimeConfig } : undefined);
+  if (resolveStorageBackend(config) !== "azuresql") {
+    return pluginStateDeleteEntriesIfUnchanged(params);
+  }
+  const [{ createAzureSqlPluginStateStore }, { resolvePluginStateRuntimeOptions }] =
+    await Promise.all([
+      import("../storage/plugin-state-store-factory.js"),
+      import("../storage/plugin-state-runtime-options.js"),
+    ]);
+  const store = createAzureSqlPluginStateStore(
+    await resolvePluginStateRuntimeOptions(config, params.env ?? process.env),
+  );
+  return await store.deleteEntriesIfUnchanged(
+    {
+      pluginId: params.pluginId,
+      namespace: params.namespace,
+      maxEntries: MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
+      overflowPolicy: "evict-oldest",
+    },
+    params.entries.map(({ value: _value, ...entry }) => entry),
+    params.assertCurrent,
+  );
 }
 
 export async function closePluginStateAzureSqlRuntime(): Promise<void> {
