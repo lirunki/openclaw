@@ -14,6 +14,7 @@ import {
   bindGatewayContextResolver,
   getGatewayContextResolver,
 } from "../../../plugins/runtime/gateway-request-scope.js";
+import type { SubagentRunChange } from "../../../storage/task-cohort-store.js";
 import { prepareCanonicalTaskActivation } from "../../../tasks/task-backing-authority-write.js";
 import { createSubagentTaskBackingDetail } from "../../../tasks/task-backing-authority.js";
 import { removeInternalSessionEffectsSession } from "../../internal-session-effects.js";
@@ -263,6 +264,32 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
       ...[...killReconciliationSnapshots.keys()].map((entry) => entry.runId),
       ...[...wakeSnapshots.keys()].map((entry) => entry.runId),
     ];
+    const expectedRuns = new Map<string, SubagentRunRecord | null>([
+      [previousRunId, sourceSnapshot],
+    ]);
+    if (previousRunId !== nextRunId) {
+      expectedRuns.set(nextRunId, null);
+    }
+    const expectedRun = (entry: SubagentRunRecord): SubagentRunRecord => {
+      const retained = expectedRuns.get(entry.runId);
+      if (retained) {
+        return retained;
+      }
+      const snapshot = structuredClone(entry);
+      expectedRuns.set(entry.runId, snapshot);
+      return snapshot;
+    };
+    for (const [entry, snapshot] of killReconciliationSnapshots) {
+      expectedRun(entry).killReconciliation = snapshot;
+    }
+    for (const [entry, wake] of wakeSnapshots) {
+      expectedRun(entry).requesterSettleWake = wake;
+    }
+    const runChanges: SubagentRunChange[] = [...new Set(changedRunIds)].map((runId) => ({
+      runId,
+      expected: expectedRuns.get(runId) ?? null,
+      next: this.options.runs.get(runId) ?? null,
+    }));
     const rollbackReplacement = () => {
       this.restoreKillReconciliationSnapshots(killReconciliationSnapshots);
       for (const [member, wake] of wakeSnapshots) {
@@ -334,10 +361,18 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
         commitSubagentTaskReplacement({
           runs: this.options.runs,
           changedRunIds,
+          runChanges,
           source: sourceSnapshot,
           successor: next,
           task: taskActivation,
-          canReconcileAcceptedReceipt,
+          ...(canReconcileAcceptedReceipt() && acceptedReceipt && acceptanceSessionTarget
+            ? {
+                acceptedRestartReceipt: {
+                  receipt: acceptedReceipt,
+                  sessionTarget: acceptanceSessionTarget,
+                },
+              }
+            : {}),
         });
         return;
       }

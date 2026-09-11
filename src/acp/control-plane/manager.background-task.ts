@@ -10,11 +10,12 @@ import {
   failTaskRunByRunId,
   startTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
+import { getTaskById } from "../../tasks/runtime-internal.js";
 import { createNextAcpTaskBackingDetail } from "../../tasks/task-backing-authority.js";
 import { resolveRequiredCompletionTerminalResult } from "../../tasks/task-completion-contract.js";
+import { bindTaskExecution } from "../../tasks/task-execution-binding.js";
 import { bindTaskFlowExecution } from "../../tasks/task-flow-registry.store.sqlite.js";
 import { listTasksForRelatedSessionKey } from "../../tasks/task-registry-query.js";
-import { bindTaskRunExecution } from "../../tasks/task-registry.store.sqlite.js";
 import {
   deliveryContextFromSession,
   type DeliveryContext,
@@ -225,7 +226,8 @@ export function bindBackgroundTaskExecution(
   admitted: AdmittedRunContext,
 ): void {
   try {
-    const taskResult = bindTaskRunExecution({ admitted, taskId: record.taskId });
+    const expectedTask = getTaskById(record.taskId);
+    const taskResult = expectedTask ? bindTaskExecution({ admitted, expectedTask }) : "missing";
     const flowResult = record.parentFlowId
       ? isRetainedExecutionOwnerBinding(taskResult)
         ? bindTaskFlowExecution({ admitted, flowId: record.parentFlowId })

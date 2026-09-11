@@ -2,13 +2,14 @@ import type { MessagePort } from "node:worker_threads";
 
 export const STORAGE_SYNC_BRIDGE_PROTOCOL_VERSION = 1;
 
-export type StorageSyncBridgeDomain = "control" | "plugin-state";
+export type StorageSyncBridgeDomain = "control" | "plugin-state" | "task-cohort";
 
 export type SerializedStorageSyncBridgeError = {
   name: string;
   message: string;
   code?: string;
   operation?: string;
+  outcomeUnknown?: true;
 };
 
 export type StorageSyncBridgeRequest = {

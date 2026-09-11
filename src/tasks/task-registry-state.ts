@@ -4,6 +4,8 @@ import { uniqueStrings } from "@openclaw/normalization-core/string-normalization
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { createLazyPromiseLoader } from "../shared/lazy-runtime.js";
+import { StorageSyncBridgeOutcomeUnknownError } from "../storage/storage-sync-bridge.js";
+import type { TaskCohortTaskState } from "../storage/task-cohort-store.js";
 import type { TaskRegistryControlRuntime } from "./task-registry-control.types.js";
 import {
   cloneTaskDeliveryState,
@@ -157,9 +159,46 @@ export function persistTaskRegistry(): boolean {
   }
 }
 
+function currentTaskCohortState(taskId: string): TaskCohortTaskState {
+  const task = tasks.get(taskId);
+  if (!task) {
+    return { taskId, task: null, deliveryState: null };
+  }
+  return {
+    taskId,
+    task,
+    deliveryState: taskDeliveryStates.get(taskId) ?? null,
+  };
+}
+
+function assertTaskStateCommitted(
+  result: ReturnType<NonNullable<ReturnType<typeof getTaskRegistryStore>["commitTaskState"]>>,
+): void {
+  if (result.status === "applied" || result.status === "already-applied") {
+    return;
+  }
+  if (result.status === "conflict" || result.status === "outcome-unknown") {
+    throw new Error(`Task cohort mutation did not commit: ${result.status}/${result.reason}`);
+  }
+  throw new Error("Task cohort mutation returned an invalid result");
+}
+
 function persistTaskUpsert(task: TaskRecord, pendingDeliveryState?: TaskDeliveryState): void {
   const store = getTaskRegistryStore();
   const deliveryState = pendingDeliveryState ?? taskDeliveryStates.get(task.taskId);
+  if (store.commitTaskState) {
+    assertTaskStateCommitted(
+      store.commitTaskState({
+        expected: currentTaskCohortState(task.taskId),
+        next: {
+          taskId: task.taskId,
+          task,
+          deliveryState: deliveryState ?? null,
+        },
+      }),
+    );
+    return;
+  }
   if (store.upsertTaskWithDeliveryState) {
     store.upsertTaskWithDeliveryState({
       task,
@@ -182,6 +221,20 @@ function persistTaskUpsert(task: TaskRecord, pendingDeliveryState?: TaskDelivery
   });
 }
 
+function failTaskRegistryAfterAmbiguousCommit(error: unknown): void {
+  if (!(error instanceof StorageSyncBridgeOutcomeUnknownError)) {
+    return;
+  }
+  clearTaskRegistryMemory();
+  taskRegistryRestoreState = {
+    status: "failed",
+    error: new Error(
+      "Task registry mutation timed out with an unknown commit outcome; reload canonical task state before continuing.",
+      { cause: error },
+    ),
+  };
+}
+
 export function tryPersistTaskUpsert(
   task: TaskRecord,
   operation: string,
@@ -191,6 +244,7 @@ export function tryPersistTaskUpsert(
     persistTaskUpsert(task, pendingDeliveryState);
     return true;
   } catch (error) {
+    failTaskRegistryAfterAmbiguousCommit(error);
     taskRegistryLog.warn("Failed to persist task registry upsert", {
       operation,
       taskId: task.taskId,
@@ -203,6 +257,15 @@ export function tryPersistTaskUpsert(
 
 function persistTaskDelete(taskId: string) {
   const store = getTaskRegistryStore();
+  if (store.commitTaskState) {
+    assertTaskStateCommitted(
+      store.commitTaskState({
+        expected: currentTaskCohortState(taskId),
+        next: { taskId, task: null, deliveryState: null },
+      }),
+    );
+    return;
+  }
   if (store.deleteTaskWithDeliveryState) {
     // Composite delete removes the task row and its delivery state in a single
     // transaction. This is the only atomic "remove both records" store
@@ -233,6 +296,7 @@ export function tryPersistTaskDelete(taskId: string): boolean {
     persistTaskDelete(taskId);
     return true;
   } catch (error) {
+    failTaskRegistryAfterAmbiguousCommit(error);
     taskRegistryLog.warn("Failed to persist task registry delete", {
       taskId,
       error,
@@ -243,6 +307,16 @@ export function tryPersistTaskDelete(taskId: string): boolean {
 
 function persistTaskDeliveryStateUpsert(state: TaskDeliveryState) {
   const store = getTaskRegistryStore();
+  const current = currentTaskCohortState(state.taskId);
+  if (store.commitTaskState && current.task) {
+    assertTaskStateCommitted(
+      store.commitTaskState({
+        expected: current,
+        next: { taskId: state.taskId, task: current.task, deliveryState: state },
+      }),
+    );
+    return;
+  }
   if (store.upsertDeliveryState) {
     store.upsertDeliveryState(state);
     return;
@@ -260,6 +334,7 @@ export function tryPersistTaskDeliveryStateUpsert(state: TaskDeliveryState): boo
     persistTaskDeliveryStateUpsert(state);
     return true;
   } catch (error) {
+    failTaskRegistryAfterAmbiguousCommit(error);
     taskRegistryLog.warn("Failed to persist task delivery state", {
       taskId: state.taskId,
       error,

@@ -249,7 +249,7 @@ describe("atomic subagent completion admission store", () => {
     const input = persistOwner(failedRecords("cancelled", { status: "error" }));
     const before = structuredClone(input);
     database.db.exec(
-      "CREATE TEMP TRIGGER reject_nonsuccess_task AFTER UPDATE ON task_runs " +
+      "CREATE TRIGGER reject_nonsuccess_task AFTER UPDATE ON task_runs " +
         "BEGIN SELECT RAISE(ABORT, 'cut:nonsuccess-task'); END",
     );
     const driver = requesterWakeDriver([input]);

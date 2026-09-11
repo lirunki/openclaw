@@ -1,36 +1,26 @@
-import { isDeepStrictEqual } from "node:util";
-import { runOpenClawStateWriteTransaction } from "../../../state/openclaw-state-db.js";
+import { prepareTaskCohortOperation } from "../../../storage/task-cohort-operation.js";
+import type {
+  AcceptedRestartReceiptReconciliation,
+  ReplaceSubagentTaskCommand,
+  SubagentRunChange,
+} from "../../../storage/task-cohort-store.js";
 import { publishTaskRecordAfterAtomicStore } from "../../../tasks/runtime-internal.js";
 import type { PreparedCanonicalTaskActivation } from "../../../tasks/task-backing-authority-write.js";
 import { readTaskBackingInstance } from "../../../tasks/task-backing-authority.js";
-import {
-  bindTaskFlowRecord,
-  readTaskFlowRecord,
-  upsertTaskFlowRowInDatabase,
-} from "../../../tasks/task-flow-registry.store.sqlite.js";
+import { taskCohortSyncBridge } from "../../../tasks/task-cohort-sync-bridge.js";
 import {
   prepareTaskMirroredFlowSync,
   publishTaskFlowAfterAtomicStore,
 } from "../../../tasks/task-flow-runtime-internal.js";
-import {
-  bindTaskRecord,
-  readTaskRecord,
-  upsertTaskRunRowInDatabase,
-} from "../../../tasks/task-registry.store.sqlite.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import { publishSubagentRunsAfterAtomicStore } from "./subagent-registry-state.js";
-import {
-  bindSubagentRunRecord,
-  deleteSubagentRunRowInDatabase,
-  readSubagentRun,
-  upsertSubagentRunRowInDatabase,
-} from "./subagent-registry.store.sqlite.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 function assertReplacementCorrelation(params: {
   source: SubagentRunRecord;
   successor: SubagentRunRecord;
   task: PreparedCanonicalTaskActivation;
+  runChanges: readonly SubagentRunChange[];
 }): void {
   const sourceBacking = readTaskBackingInstance(params.task.current.detail);
   const successorBacking = readTaskBackingInstance(params.task.next.detail);
@@ -38,6 +28,10 @@ function assertReplacementCorrelation(params: {
   const preservesAcceptedTerminal =
     (params.task.current.status === "succeeded" || params.task.current.status === "cancelled") &&
     params.task.next.status === params.task.current.status;
+  const sourceChange = params.runChanges.find((change) => change.runId === params.source.runId);
+  const successorChange = params.runChanges.find(
+    (change) => change.runId === params.successor.runId,
+  );
   if (
     successorBacking?.runtime !== "subagent" ||
     (sourceBacking !== undefined &&
@@ -49,7 +43,17 @@ function assertReplacementCorrelation(params: {
     params.task.current.childSessionKey !== params.source.childSessionKey ||
     params.successor.taskRunId !== canonicalRunId ||
     params.successor.childSessionKey !== params.source.childSessionKey ||
-    (params.task.next.status !== "running" && !preservesAcceptedTerminal)
+    (params.task.next.status !== "running" && !preservesAcceptedTerminal) ||
+    !sourceChange ||
+    !successorChange ||
+    sourceChange.expected?.runId !== params.source.runId ||
+    successorChange.next?.runId !== params.successor.runId ||
+    new Set(params.runChanges.map((change) => change.runId)).size !== params.runChanges.length ||
+    params.runChanges.some(
+      (change) =>
+        (change.expected?.runId !== undefined && change.expected.runId !== change.runId) ||
+        (change.next?.runId !== undefined && change.next.runId !== change.runId),
+    )
   ) {
     throw new Error("replacement subagent and task do not share one owner generation");
   }
@@ -59,65 +63,35 @@ function assertReplacementCorrelation(params: {
 export function commitSubagentTaskReplacement(params: {
   runs: Map<string, SubagentRunRecord>;
   changedRunIds: readonly string[];
+  runChanges: readonly SubagentRunChange[];
   source: SubagentRunRecord;
   successor: SubagentRunRecord;
   task: PreparedCanonicalTaskActivation;
-  canReconcileAcceptedReceipt?: () => boolean;
+  acceptedRestartReceipt?: AcceptedRestartReceiptReconciliation;
 }): void {
   assertReplacementCorrelation(params);
-  const changedRows = params.changedRunIds.flatMap((runId) => {
-    const entry = params.runs.get(runId);
-    return entry ? [bindSubagentRunRecord(entry)] : [];
-  });
-  const deletedRunIds = params.changedRunIds.filter((runId) => !params.runs.has(runId));
-  const sourceRow = bindSubagentRunRecord(params.source);
-  const currentTaskRow = bindTaskRecord(params.task.current);
-  const taskRow = bindTaskRecord(params.task.next);
   const flow = prepareTaskMirroredFlowSync(params.task.next);
-  const currentFlowRow = flow ? bindTaskFlowRecord(flow.current) : undefined;
-  const flowRow = flow ? bindTaskFlowRecord(flow.next) : undefined;
+  const command: ReplaceSubagentTaskCommand = prepareTaskCohortOperation("replace-subagent-task", {
+    source: params.source,
+    successor: params.successor,
+    runChanges: params.runChanges,
+    task: params.task,
+    ...(flow ? { flow } : {}),
+    ...(params.acceptedRestartReceipt
+      ? { acceptedRestartReceipt: params.acceptedRestartReceipt }
+      : {}),
+  });
+  const result = taskCohortSyncBridge.replaceSubagentTask({
+    command,
+    options: { mode: "execute" },
+  });
+  if (result.status === "outcome-unknown") {
+    throw new Error("Subagent task replacement commit outcome is unknown");
+  }
+  if (result.status === "conflict") {
+    throw new Error(`replacement ${result.reason.replaceAll("-", " ")} before commit`);
+  }
 
-  runOpenClawStateWriteTransaction(
-    (database) => {
-      const storedSource = readSubagentRun(database, params.source.runId);
-      const storedTask = readTaskRecord(database.db, params.task.current.taskId);
-      const storedReceipt = storedSource?.execution.restartRecovery;
-      if (
-        (storedReceipt?.phase === "attempted" || storedReceipt?.phase === "consumed") &&
-        params.canReconcileAcceptedReceipt?.()
-      ) {
-        // Acceptance was witnessed by this live owner, but its write failed.
-        // Reconcile only that phase; every other field must still match below.
-        storedReceipt.phase = "accepted";
-      }
-      if (!storedSource || !isDeepStrictEqual(bindSubagentRunRecord(storedSource), sourceRow)) {
-        throw new Error("replacement subagent source changed before commit");
-      }
-      if (!storedTask || !isDeepStrictEqual(bindTaskRecord(storedTask), currentTaskRow)) {
-        throw new Error("replacement task source changed before commit");
-      }
-      if (flow && currentFlowRow) {
-        const storedFlow = readTaskFlowRecord(database.db, flow.current.flowId);
-        if (!storedFlow || !isDeepStrictEqual(bindTaskFlowRecord(storedFlow), currentFlowRow)) {
-          throw new Error("replacement task flow source changed before commit");
-        }
-      }
-      for (const row of changedRows) {
-        upsertSubagentRunRowInDatabase(database, row);
-      }
-      for (const runId of deletedRunIds) {
-        deleteSubagentRunRowInDatabase(database, runId);
-      }
-      upsertTaskRunRowInDatabase(database, taskRow);
-      if (flowRow) {
-        upsertTaskFlowRowInDatabase(database.db, flowRow);
-      }
-    },
-    undefined,
-    { operationLabel: "subagent task replacement" },
-  );
-  // Observer callbacks may reenter lifecycle fencing, so ownership must move
-  // before any committed successor/task/flow snapshot becomes visible.
   subagentRuns.commitOwnership(params.successor);
   const deferredObserverEvents: Array<() => void> = [];
   publishSubagentRunsAfterAtomicStore(params.runs, params.changedRunIds, deferredObserverEvents);

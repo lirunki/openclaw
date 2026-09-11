@@ -12,6 +12,7 @@ import {
 } from "../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { closeTaskCohortSyncBridge } from "../tasks/task-cohort-sync-bridge.js";
 
 let fileLockDrainerForTests: typeof drainFileLockStateForTest | null = null;
 let sessionStoreWriterQueueDrainerForTests: typeof drainSessionStoreWriterQueuesForTest | null =
@@ -57,6 +58,8 @@ export async function cleanupSessionStateForTest(
       closeOpenClawAgentDatabaseByPath(database.path);
     }
   }
+  // The task compatibility worker owns a separate handle to this fixture.
+  closeTaskCohortSyncBridge();
   closeOpenClawStateDatabaseByPath(
     resolveOpenClawStateSqlitePath({ ...process.env, OPENCLAW_STATE_DIR: options.stateDir }),
   );

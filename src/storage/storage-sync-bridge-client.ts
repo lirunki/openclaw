@@ -18,7 +18,14 @@ const DEFAULT_MAX_PAYLOAD_BYTES = 256 * 1024 * 1024;
 const RESPONSE_SIGNAL_INDEX = 0;
 const MAX_REQUEST_ID = 0x7fff_ffff;
 
-export class StorageSyncBridgeTimeoutError extends Error {
+export class StorageSyncBridgeOutcomeUnknownError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "StorageSyncBridgeOutcomeUnknownError";
+  }
+}
+
+export class StorageSyncBridgeTimeoutError extends StorageSyncBridgeOutcomeUnknownError {
   constructor(message: string) {
     super(message);
     this.name = "StorageSyncBridgeTimeoutError";
@@ -160,6 +167,9 @@ export class StorageSyncBridgeClient {
       throw workerFailure("Storage compatibility worker returned a mismatched response.");
     }
     if (!response.ok) {
+      if (response.error.outcomeUnknown) {
+        throw new StorageSyncBridgeOutcomeUnknownError(response.error.message);
+      }
       throw new StorageSyncBridgeRemoteError(response.error);
     }
     return response.value;
@@ -219,7 +229,9 @@ export class StorageSyncBridgeClient {
       throw error;
     }
     if (Atomics.load(bridge.signal, RESPONSE_SIGNAL_INDEX) !== requestId) {
-      const error = workerFailure("Storage compatibility worker signaled an unexpected response.");
+      const error = new StorageSyncBridgeOutcomeUnknownError(
+        "Storage compatibility worker signaled an unexpected response; the commit outcome is unknown.",
+      );
       void this.retireBridge(bridge, error);
       throw error;
     }
@@ -228,15 +240,15 @@ export class StorageSyncBridgeClient {
       // SAFETY: each closed domain command fixes its response type at the call site.
       return this.decodeResponse(received, bridge, requestId) as T;
     } catch (error) {
-      if (!(error instanceof StorageSyncBridgeRemoteError)) {
-        void this.retireBridge(
-          bridge,
-          error instanceof Error
-            ? error
-            : workerFailure("Storage compatibility worker response failed.", error),
-        );
+      if (error instanceof StorageSyncBridgeRemoteError) {
+        throw error;
       }
-      throw error;
+      const ambiguous = new StorageSyncBridgeOutcomeUnknownError(
+        "Storage compatibility worker response could not be verified; the commit outcome is unknown.",
+        { cause: error },
+      );
+      void this.retireBridge(bridge, ambiguous);
+      throw ambiguous;
     }
   }
 

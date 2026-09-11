@@ -345,7 +345,7 @@ it.each(["successor", "task", "flow"] as const)(
     const before = loadSubagentRegistryFromSqlite();
     const taskBefore = getTaskById(state.task.taskId);
     const flowBefore = getTaskFlowById(state.task.parentFlowId!);
-    state.database.exec(`CREATE TEMP TRIGGER reject_recovery_replacement
+    state.database.exec(`CREATE TRIGGER reject_recovery_replacement
       ${rejectedWrite === "successor" ? "BEFORE INSERT ON subagent_runs WHEN NEW.run_id = 'acceptance-successor'" : rejectedWrite === "task" ? "BEFORE UPDATE ON task_runs" : "BEFORE UPDATE ON flow_runs"}
       BEGIN SELECT RAISE(ABORT, 'atomic recovery write rejected'); END`);
     try {

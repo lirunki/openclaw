@@ -5,7 +5,7 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import { uniqueValues } from "@openclaw/normalization-core/string-normalization";
 import { normalizeAgentId } from "../routing/session-key.js";
-import { listTaskRegistryRecordsByRuntimeSourceIdFromSqlite } from "../tasks/task-registry.store.sqlite.js";
+import { taskCohortSyncBridge } from "../tasks/task-cohort-sync-bridge.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
 import type { CronRunLogEntry } from "./run-log-types.js";
 import {
@@ -132,10 +132,11 @@ export function readCronTaskRunHistoryPage(
   const agentId = options.agentId ? normalizeAgentId(options.agentId) : undefined;
   const query = normalizeLowercaseStringOrEmpty(options.query);
   const sortDir: CronRunHistorySortDir = options.sortDir === "asc" ? "asc" : "desc";
-  const rows = listTaskRegistryRecordsByRuntimeSourceIdFromSqlite({
-    runtime: "cron",
-    sourceId: jobId,
-  })
+  const rows = taskCohortSyncBridge
+    .listTasksByRuntimeSource({
+      runtime: "cron",
+      sourceId: jobId,
+    })
     .filter((task) => cronTaskRecordStoreKey(task) === options.storeKey)
     .filter((task) => !agentId || task.agentId === agentId)
     .map((task) => ({ task, entry: cronTaskRecordToRunLogEntry(task) }))

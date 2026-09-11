@@ -312,16 +312,16 @@ it.each(["successor", "task activation", "flow activation"] as const)(
     }`;
     database.exec(
       rejectedWrite === "successor"
-        ? `CREATE TEMP TRIGGER ${triggerName}
+        ? `CREATE TRIGGER ${triggerName}
            BEFORE INSERT ON subagent_runs
            WHEN NEW.run_id = 'rollback-successor'
            BEGIN SELECT RAISE(ABORT, 'successor write rejected'); END`
         : rejectedWrite === "task activation"
-          ? `CREATE TEMP TRIGGER ${triggerName}
+          ? `CREATE TRIGGER ${triggerName}
              BEFORE UPDATE ON task_runs
              WHEN NEW.status = 'running'
              BEGIN SELECT RAISE(ABORT, 'task activation write rejected'); END`
-          : `CREATE TEMP TRIGGER ${triggerName}
+          : `CREATE TRIGGER ${triggerName}
              BEFORE UPDATE ON flow_runs
              WHEN NEW.status = 'running'
              BEGIN SELECT RAISE(ABORT, 'flow activation write rejected'); END`,

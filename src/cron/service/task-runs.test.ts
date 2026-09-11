@@ -17,8 +17,8 @@ import { readCronTaskRunHistoryPage } from "../task-run-history.js";
 import type { CronJob } from "../types.js";
 import { timeoutErrorMessage } from "./execution-errors.js";
 import { createCronServiceState as createCronServiceStateBase } from "./state.js";
+import { findCronTaskRunRecoveryInDatabase } from "./task-run-recovery.test-helpers.js";
 import {
-  findCronTaskRunRecoveryInDatabase,
   tryCreateCronTaskRunHandle,
   tryFinishCronTaskRun,
   tryFinishCronTaskRunWithoutHistory,

@@ -59,6 +59,7 @@ import {
   resolveTaskForLookupToken,
   setTaskCleanupAfterById,
 } from "./runtime-internal.js";
+import { taskCohortSyncBridge } from "./task-cohort-sync-bridge.js";
 import { runTaskFlowRegistryMaintenance } from "./task-flow-registry.maintenance.js";
 import { getTaskRegistryMaintenanceSnapshot } from "./task-registry-maintenance-snapshot.js";
 import {
@@ -67,10 +68,6 @@ import {
   summarizeTaskAuditFindings,
 } from "./task-registry.audit.js";
 import type { TaskAuditFinding, TaskAuditSummary } from "./task-registry.audit.js";
-import {
-  listTaskRegistryRecordsByRuntimeSourceIdFromSqlite,
-  loadTaskRegistryStateFromSqliteReadOnlyResult,
-} from "./task-registry.store.sqlite.js";
 import { summarizeTaskRecords } from "./task-registry.summary.js";
 import type { TaskRecord, TaskRegistrySummary, TaskStatus } from "./task-registry.types.js";
 import type { ActiveTaskRestartBlocker } from "./task-restart-blocker.js";
@@ -125,7 +122,7 @@ type TaskRegistryMaintenanceRuntime = {
   resolveTaskForLookupToken: typeof resolveTaskForLookupToken;
   setTaskCleanupAfterById: typeof setTaskCleanupAfterById;
   isRuntimeAuthoritative: () => boolean;
-  listTaskRegistryRecordsByRuntimeSourceIdFromSqlite: typeof listTaskRegistryRecordsByRuntimeSourceIdFromSqlite;
+  listTaskRegistryRecordsByRuntimeSourceId: typeof taskCohortSyncBridge.listTasksByRuntimeSource;
 };
 
 const defaultTaskRegistryMaintenanceRuntime: TaskRegistryMaintenanceRuntime = {
@@ -167,7 +164,7 @@ const defaultTaskRegistryMaintenanceRuntime: TaskRegistryMaintenanceRuntime = {
   resolveTaskForLookupToken,
   setTaskCleanupAfterById,
   isRuntimeAuthoritative: () => configuredRuntimeAuthoritative,
-  listTaskRegistryRecordsByRuntimeSourceIdFromSqlite,
+  listTaskRegistryRecordsByRuntimeSourceId: taskCohortSyncBridge.listTasksByRuntimeSource,
 };
 
 let taskRegistryMaintenanceRuntime: TaskRegistryMaintenanceRuntime =
@@ -345,7 +342,7 @@ function getCronTaskRows(context: CronRecoveryContext, jobId: string): TaskRecor
   }
   let rows: TaskRecord[];
   try {
-    rows = taskRegistryMaintenanceRuntime.listTaskRegistryRecordsByRuntimeSourceIdFromSqlite({
+    rows = taskRegistryMaintenanceRuntime.listTaskRegistryRecordsByRuntimeSourceId({
       runtime: "cron",
       sourceId: jobId,
     });
@@ -853,10 +850,10 @@ export function inspectTasksReadOnly(): {
   tasks: TaskRecord[];
   state: "ready" | "migration-required";
 } {
-  const loaded = loadTaskRegistryStateFromSqliteReadOnlyResult();
+  const loaded = taskCohortSyncBridge.inspectReadOnly();
   return {
     state: loaded.state,
-    tasks: reconcileTaskRecordsForOperatorInspection([...loaded.snapshot.tasks.values()]),
+    tasks: reconcileTaskRecordsForOperatorInspection([...loaded.snapshot.tasks]),
   };
 }
 

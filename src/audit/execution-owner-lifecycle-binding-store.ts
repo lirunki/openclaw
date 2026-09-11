@@ -9,6 +9,7 @@ import type { DB as OpenClawStateDatabase } from "../state/openclaw-state-db.gen
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../state/openclaw-state-schema.js";
 import {
   classifyExecutionOwnerBinding,
+  type ExecutionOwnerBinding,
   type ExecutionOwnerBindingResult,
 } from "./execution-owner-binding.js";
 
@@ -51,6 +52,26 @@ function classifyRetainedBinding(
     binding,
   );
   return state === "unbound" ? "mismatch" : state;
+}
+
+/** Reads exact owner metadata without allocating the opt-in table. */
+export function readExecutionOwnerLifecycleMetadata(params: {
+  db: DatabaseSync;
+  ownerKind: ExecutionOwnerLifecycleKind;
+  ownerId: string;
+}): ExecutionOwnerBinding | undefined {
+  if (!tableExists(params.db, EXECUTION_OWNER_LIFECYCLE_BINDING_TABLE)) {
+    return undefined;
+  }
+  const current = executeSqliteQueryTakeFirstSync(
+    params.db,
+    lifecycleDb(params.db)
+      .selectFrom(EXECUTION_OWNER_LIFECYCLE_BINDING_TABLE)
+      .select(["context_id", "execution_id"])
+      .where("owner_kind", "=", params.ownerKind)
+      .where("owner_id", "=", params.ownerId),
+  );
+  return current ? { contextId: current.context_id, executionId: current.execution_id } : undefined;
 }
 
 /** Stores one exact admission identity after its canonical owner row has been revalidated. */

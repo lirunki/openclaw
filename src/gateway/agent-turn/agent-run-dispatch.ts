@@ -37,9 +37,9 @@ import { withTimeout } from "../../infra/fs-safe.js";
 import { defaultRuntime } from "../../runtime.js";
 import { createRunningTaskRun } from "../../tasks/detached-task-runtime.js";
 import { getTaskById } from "../../tasks/runtime-internal.js";
+import { bindTaskExecution } from "../../tasks/task-execution-binding.js";
 import { bindTaskFlowExecution } from "../../tasks/task-flow-registry.store.sqlite.js";
 import { mapAgentRunTerminalOutcomeToTaskStatus } from "../../tasks/task-registry-common.js";
-import { bindTaskRunExecution } from "../../tasks/task-registry.store.sqlite.js";
 import type { TaskRecord } from "../../tasks/task-registry.types.js";
 import { bindTaskRunOwner } from "../../tasks/task-run-owner.js";
 import { normalizeDeliveryContext } from "../../utils/delivery-context.shared.js";
@@ -223,7 +223,7 @@ export function dispatchAgentRunFromGateway(params: {
     ? createExecutionStartedOwnerBinding(
         (admitted: Parameters<NonNullable<AgentCommandOpts["onPostAdmittedRunContext"]>>[0]) => {
           try {
-            const taskResult = bindTaskRunExecution({ admitted, taskId: trackedTask.taskId });
+            const taskResult = bindTaskExecution({ admitted, expectedTask: trackedTask });
             const flowResult = trackedTask.parentFlowId
               ? isRetainedExecutionOwnerBinding(taskResult)
                 ? bindTaskFlowExecution({ admitted, flowId: trackedTask.parentFlowId })

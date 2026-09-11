@@ -1,15 +1,14 @@
+import { prepareTaskCohortOperation } from "../storage/task-cohort-operation.js";
+import type {
+  CommitTaskStateCommand,
+  CommitTaskStateResult,
+  TaskCohortTaskState,
+} from "../storage/task-cohort-store.js";
+import { closeTaskCohortSyncBridge, taskCohortSyncBridge } from "./task-cohort-sync-bridge.js";
 // Stores task registry records in memory and bridges persistence runtime hooks.
 import {
   closeTaskRegistryDatabase,
-  deleteTaskAndDeliveryStateFromSqlite,
-  deleteTaskDeliveryStateFromSqlite,
-  deleteTaskRegistryRecordFromSqlite,
-  loadTaskRegistryStateFromSqlite,
-  listTaskRegistryRecordsByOwnerKeyFromSqlite,
   saveTaskRegistryStateToSqlite,
-  upsertTaskWithDeliveryStateToSqlite,
-  upsertTaskDeliveryStateToSqlite,
-  upsertTaskRegistryRecordToSqlite,
 } from "./task-registry.store.sqlite.js";
 import type { TaskRegistryStoreSnapshot } from "./task-registry.store.types.js";
 import type { TaskDeliveryState, TaskRecord } from "./task-registry.types.js";
@@ -20,6 +19,10 @@ export type TaskRegistryStore = {
   loadSnapshot: () => TaskRegistryStoreSnapshot;
   saveSnapshot: (snapshot: TaskRegistryStoreSnapshot) => void;
   listTasksForOwnerKey?: (ownerKey: string) => TaskRecord[];
+  commitTaskState?: (params: {
+    expected: TaskCohortTaskState;
+    next: TaskCohortTaskState;
+  }) => CommitTaskStateResult;
   upsertTaskWithDeliveryState?: (params: {
     task: TaskRecord;
     deliveryState?: TaskDeliveryState;
@@ -53,17 +56,31 @@ type TaskRegistryObservers = {
   onEvent?: (event: TaskRegistryObserverEvent) => void;
 };
 
+function loadDefaultTaskSnapshot(): TaskRegistryStoreSnapshot {
+  const snapshot = taskCohortSyncBridge.loadSnapshot();
+  return {
+    tasks: new Map(snapshot.tasks.map((task) => [task.taskId, task])),
+    deliveryStates: new Map(snapshot.deliveryStates.map((state) => [state.taskId, state])),
+  };
+}
+
+function commitDefaultTaskState(params: {
+  expected: TaskCohortTaskState;
+  next: TaskCohortTaskState;
+}): CommitTaskStateResult {
+  const command: CommitTaskStateCommand = prepareTaskCohortOperation("commit-task-state", params);
+  return taskCohortSyncBridge.commitTaskState({ command, options: { mode: "execute" } });
+}
+
 const defaultTaskRegistryStore: TaskRegistryStore = {
-  loadSnapshot: loadTaskRegistryStateFromSqlite,
+  loadSnapshot: loadDefaultTaskSnapshot,
   saveSnapshot: saveTaskRegistryStateToSqlite,
-  listTasksForOwnerKey: listTaskRegistryRecordsByOwnerKeyFromSqlite,
-  upsertTaskWithDeliveryState: upsertTaskWithDeliveryStateToSqlite,
-  upsertTask: upsertTaskRegistryRecordToSqlite,
-  deleteTaskWithDeliveryState: deleteTaskAndDeliveryStateFromSqlite,
-  deleteTask: deleteTaskRegistryRecordFromSqlite,
-  upsertDeliveryState: upsertTaskDeliveryStateToSqlite,
-  deleteDeliveryState: deleteTaskDeliveryStateFromSqlite,
-  close: closeTaskRegistryDatabase,
+  listTasksForOwnerKey: taskCohortSyncBridge.listTasksForOwnerKey,
+  commitTaskState: commitDefaultTaskState,
+  close: () => {
+    closeTaskCohortSyncBridge();
+    closeTaskRegistryDatabase();
+  },
 };
 
 let configuredTaskRegistryStore: TaskRegistryStore = defaultTaskRegistryStore;

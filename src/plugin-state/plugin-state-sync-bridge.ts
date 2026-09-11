@@ -9,8 +9,8 @@ import type { SerializedStorageSyncBridgeError } from "../storage/storage-sync-b
 import {
   closeStorageSyncBridge,
   requestStorageSyncBridge,
+  StorageSyncBridgeOutcomeUnknownError,
   StorageSyncBridgeRemoteError,
-  StorageSyncBridgeTimeoutError,
 } from "../storage/storage-sync-bridge.js";
 import {
   PluginStateStoreError,
@@ -136,7 +136,7 @@ export class AzureSqlPluginStateSyncBridge {
       if (error instanceof StorageSyncBridgeRemoteError) {
         throw restoreError(error.remote);
       }
-      if (error instanceof StorageSyncBridgeTimeoutError) {
+      if (error instanceof StorageSyncBridgeOutcomeUnknownError) {
         throw new PluginStateStoreError(error.message, {
           ...timeoutFailureForRequest(request),
           cause: error,

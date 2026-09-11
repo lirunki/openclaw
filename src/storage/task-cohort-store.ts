@@ -3,10 +3,9 @@ import type {
   SubagentRestartRecoveryReceipt,
   SubagentRunRecord,
 } from "../agents/subagents/registry/subagent-registry.types.js";
-import type {
-  ExecutionOwnerBinding,
-  ExecutionOwnerBindingResult,
-} from "../audit/execution-owner-binding.js";
+import type { ExecutionOwnerBinding } from "../audit/execution-owner-binding.js";
+import type { CronRunReceiptRecoveryCandidate } from "../cron/store/run-receipt-store.js";
+import type { CronJob } from "../cron/types.js";
 import type { QueuedSessionDelivery } from "../infra/session-delivery-queue-storage.js";
 import type { PreparedCanonicalTaskActivation } from "../tasks/task-backing-authority-write.js";
 import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
@@ -32,18 +31,28 @@ export type TaskCohortTaskState =
       deliveryState: TaskDeliveryState | null;
     }>;
 
-/**
- * Atomically compare-replaces one task and its delivery companion. The backend
- * must return already-applied when current state equals next after a retry.
- */
+/** Atomically compare-replaces one task and its delivery companion. */
 export type CommitTaskStateCommand = Readonly<{
   operationId: string;
   expected: TaskCohortTaskState;
   next: TaskCohortTaskState;
 }>;
 
+export type TaskCohortMutationMode = "execute" | "reconcile";
+
+export type TaskCohortMutationOptions = Readonly<{
+  mode: TaskCohortMutationMode;
+}>;
+
 type TaskCohortOperationResult<Result> = Readonly<{ operationId: string }> &
-  (Result | Readonly<{ status: "conflict"; reason: "operation-id-reused" }>);
+  (
+    | Result
+    | Readonly<{
+        status: "conflict";
+        reason: "invalid-command" | "operation-id-mismatch";
+      }>
+    | Readonly<{ status: "outcome-unknown"; reason: "postcondition-not-proven" }>
+  );
 
 export type CommitTaskStateResult = TaskCohortOperationResult<
   | Readonly<{ status: "applied" | "already-applied"; state: TaskCohortTaskState }>
@@ -57,25 +66,31 @@ export type CommitTaskStateResult = TaskCohortOperationResult<
 /** Exact task owner and eligibility accepted for one post-admission binding. */
 export type BindTaskExecutionCommand = Readonly<{
   operationId: string;
-  taskId: string;
-  expected: Readonly<{
-    runtime: TaskRuntime;
-    runId: string | null;
-  }>;
+  expectedTask: TaskRecord;
   binding: ExecutionOwnerBinding;
 }>;
 
 export type BindTaskExecutionResult = TaskCohortOperationResult<
-  Readonly<{ status: Exclude<ExecutionOwnerBindingResult, "disabled"> }>
+  | Readonly<{ status: "applied" | "already-applied"; binding: ExecutionOwnerBinding }>
+  | Readonly<{
+      status: "conflict";
+      reason: "task-changed" | "task-ineligible" | "binding-mismatch";
+    }>
 >;
+
+export type TaskCohortExpectedRecord<Record> = Readonly<{
+  record: Record;
+  /** Initial admission historically persists process-owned records that may not yet have a row. */
+  allowAbsent: boolean;
+}>;
 
 /** Inserts one queue generation and advances its correlated subagent/task projections. */
 export type AdmitSubagentCompletionCommand = Readonly<{
   operationId: string;
   queueEntry: QueuedSessionDelivery;
-  expectedSubagent: SubagentRunRecord;
+  expectedSubagent: TaskCohortExpectedRecord<SubagentRunRecord>;
   nextSubagent: SubagentRunRecord;
-  expectedTask: TaskRecord;
+  expectedTask: TaskCohortExpectedRecord<TaskRecord>;
   nextTask: TaskRecord;
 }>;
 
@@ -114,18 +129,14 @@ export type SettleSubagentCompletionResult = TaskCohortOperationResult<
     }>
 >;
 
-/**
- * Converts one still-owned completion generation into a blocked terminal state.
- * `now` is prepared once so retries and backends derive the same durable result.
- */
+/** Commits one fully prepared blocked completion transition. */
 export type BlockSubagentCompletionCommand = Readonly<{
   operationId: string;
   expectedSubagent: SubagentRunRecord;
+  nextSubagent: SubagentRunRecord;
   expectedTask: TaskRecord;
-  reason: string;
-  now: number;
-  suspendedReason?: "expiry" | "permanent_failure";
-  disposition?: NonNullable<SubagentRunRecord["delivery"]>["disposition"];
+  nextTask: TaskRecord;
+  queuedDelivery?: QueuedSessionDelivery;
 }>;
 
 export type BlockSubagentCompletionResult = TaskCohortOperationResult<
@@ -137,7 +148,7 @@ export type BlockSubagentCompletionResult = TaskCohortOperationResult<
     }>
   | Readonly<{
       status: "conflict";
-      reason: "owner-changed" | "not-eligible";
+      reason: "queue-changed" | "subagent-changed" | "task-changed";
     }>
 >;
 
@@ -181,6 +192,53 @@ export type ReplaceSubagentTaskResult = TaskCohortOperationResult<
     }>
 >;
 
+export type CronRunRecoverySelector = Readonly<{
+  storeKey: string;
+  jobId: string;
+  startedAt: number;
+  receiptId?: string;
+}>;
+
+export type CronRunRecoveryJobState = Readonly<{
+  job: CronJob;
+  sortOrder: number;
+}> | null;
+
+export type CronRunRecoverySnapshot = Readonly<{
+  job: CronRunRecoveryJobState;
+  receipt: CronRunReceiptRecoveryCandidate | null;
+  task: TaskRecord | null;
+}>;
+
+export type CronRunRecoveryReceiptCompletion = Readonly<{
+  handle: CronRunReceiptRecoveryCandidate;
+  status: "ok" | "error" | "skipped" | "interrupted" | "superseded";
+  finishedAtMs: number;
+  error?: string;
+}>;
+
+export type RecoverCronRunCommand = Readonly<{
+  operationId: string;
+  selector: CronRunRecoverySelector;
+  expected: CronRunRecoverySnapshot;
+  next: Readonly<{
+    job: CronRunRecoveryJobState;
+    receipt: CronRunRecoveryReceiptCompletion | null;
+    task: TaskRecord | null;
+  }>;
+}>;
+
+export type RecoverCronRunResult = TaskCohortOperationResult<
+  | Readonly<{
+      status: "applied" | "already-applied";
+      state: RecoverCronRunCommand["next"];
+    }>
+  | Readonly<{
+      status: "conflict";
+      reason: "job-changed" | "receipt-changed" | "task-recovery-changed";
+    }>
+>;
+
 /**
  * Canonical asynchronous storage boundary for the task transaction cohort.
  * Implementations own backend-private transactions; callers never receive a
@@ -198,17 +256,34 @@ export interface TaskCohortStore {
     runtime: TaskRuntime;
     sourceId?: string;
   }): Promise<TaskRecord[]>;
-  commitTaskState(command: CommitTaskStateCommand): Promise<CommitTaskStateResult>;
-  bindTaskExecution(command: BindTaskExecutionCommand): Promise<BindTaskExecutionResult>;
+  commitTaskState(
+    command: CommitTaskStateCommand,
+    options: TaskCohortMutationOptions,
+  ): Promise<CommitTaskStateResult>;
+  bindTaskExecution(
+    command: BindTaskExecutionCommand,
+    options: TaskCohortMutationOptions,
+  ): Promise<BindTaskExecutionResult>;
   admitSubagentCompletion(
     command: AdmitSubagentCompletionCommand,
+    options: TaskCohortMutationOptions,
   ): Promise<AdmitSubagentCompletionResult>;
   settleSubagentCompletion(
     command: SettleSubagentCompletionCommand,
+    options: TaskCohortMutationOptions,
   ): Promise<SettleSubagentCompletionResult>;
   blockSubagentCompletion(
     command: BlockSubagentCompletionCommand,
+    options: TaskCohortMutationOptions,
   ): Promise<BlockSubagentCompletionResult>;
-  replaceSubagentTask(command: ReplaceSubagentTaskCommand): Promise<ReplaceSubagentTaskResult>;
+  replaceSubagentTask(
+    command: ReplaceSubagentTaskCommand,
+    options: TaskCohortMutationOptions,
+  ): Promise<ReplaceSubagentTaskResult>;
+  inspectCronRunRecovery(selector: CronRunRecoverySelector): Promise<CronRunRecoverySnapshot>;
+  recoverCronRun(
+    command: RecoverCronRunCommand,
+    options: TaskCohortMutationOptions,
+  ): Promise<RecoverCronRunResult>;
   close(): Promise<void>;
 }

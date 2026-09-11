@@ -23,6 +23,7 @@ import {
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { StorageSyncBridgeTimeoutError } from "../storage/storage-sync-bridge.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
@@ -1761,6 +1762,35 @@ describe("task-registry store runtime", () => {
     const after = listFreshTasksForOwnerKey(ownerKey);
     const seen = after.find((task) => task.taskId === "task-diverge");
     expect(seen?.status).toBe("running");
+  });
+
+  it("fails the registry closed after a commit-ambiguous mailbox timeout", () => {
+    configureTaskRegistryRuntime({
+      store: {
+        loadSnapshot: () => ({ tasks: new Map(), deliveryStates: new Map() }),
+        saveSnapshot: () => {},
+        commitTaskState: () => {
+          throw new StorageSyncBridgeTimeoutError(
+            "Storage compatibility worker timed out; the commit outcome is unknown.",
+          );
+        },
+      },
+    });
+
+    expect(
+      createTaskRecordOrNull({
+        runtime: "acp",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        runId: "run-ambiguous",
+        task: "Do not replay ambiguous work",
+        status: "running",
+        deliveryStatus: "pending",
+      }),
+    ).toBeNull();
+    expect(() => getTaskById("run-ambiguous")).toThrow(
+      "unknown commit outcome; reload canonical task state before continuing",
+    );
   });
 
   it("does not throw or mutate memory when create persistence fails", () => {

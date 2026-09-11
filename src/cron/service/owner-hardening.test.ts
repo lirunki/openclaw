@@ -18,6 +18,7 @@ import {
   runOpenClawStateWriteTransaction,
 } from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateDirForDatabasePath } from "../../state/openclaw-state-db.paths.js";
+import { taskCohortSyncBridge } from "../../tasks/task-cohort-sync-bridge.js";
 import { advanceCronActiveJobGeneration, isCronJobActive } from "../active-jobs.js";
 import { cronOwnerHardeningEntrypoints } from "../owner-hardening-runtime.test-support.js";
 import { CronService } from "../service.js";
@@ -33,10 +34,10 @@ import {
   prepareCronRunReceiptClaim,
   releaseLocalCronRunReceiptOwnership,
 } from "../store/run-receipt-store.js";
+import { finalizedCronTaskRun } from "../task-run-recovery.js";
 import type { CronJob } from "../types.js";
 import { listForeignReceipts } from "./foreign-receipt-monitor.js";
 import type { CronServiceState } from "./state.js";
-import { findCronTaskRunRecoveryInDatabase } from "./task-runs.js";
 
 const serviceUrl = resolveRuntimeWorkerUrl(cronOwnerHardeningEntrypoints.service);
 const stateDatabaseUrl = resolveRuntimeWorkerUrl(cronOwnerHardeningEntrypoints.stateDatabase);
@@ -390,6 +391,11 @@ describe("cron durable run ownership", () => {
     const job = makeCommandJob("receipt-finalization-failure", now + 60_000);
     await saveCronStore(storePath, { version: 1, jobs: [job] });
     inspectActiveCronRunReceipt({ storePath, jobId: job.id });
+    taskCohortSyncBridge.inspectCronRunRecovery({
+      storeKey: cronStoreKey(storePath),
+      jobId: job.id,
+      startedAt: now,
+    });
     const database = openOpenClawStateDatabase().db;
     database.exec(`
       CREATE TRIGGER reject_cron_run_receipt_finish
@@ -415,14 +421,13 @@ describe("cron durable run ownership", () => {
       expect((await loadCronStore(storePath)).jobs[0]?.state.runningAtMs).toBe(
         retained?.startedAtMs,
       );
-      const recovery = findCronTaskRunRecoveryInDatabase({
-        database,
+      const recovery = taskCohortSyncBridge.inspectCronRunRecovery({
         jobId: job.id,
         startedAt: retained!.startedAtMs,
         storeKey: cronStoreKey(storePath),
         receiptId: retained!.receiptId,
       });
-      expect(recovery.finalized?.entry.status).toBe("ok");
+      expect(finalizedCronTaskRun(recovery.task ?? undefined, job.id)?.entry.status).toBe("ok");
       // The failed transaction rolled back both row and receipt. A receipt-only
       // supersede would sever this exact terminal fact from subsequent recovery.
       database.exec("DROP TRIGGER reject_cron_run_receipt_finish");
@@ -861,20 +866,23 @@ describe("cron durable run ownership", () => {
 
     await waitForExit(child);
 
-    expect(child.signalCode).toBe("SIGKILL");
+    if (process.platform === "win32") {
+      expect(child).toMatchObject({ exitCode: 1, signalCode: null });
+    } else {
+      expect(child.signalCode).toBe("SIGKILL");
+    }
     const persisted = (await loadCronStore(storePath)).jobs[0];
     expect(persisted?.state).toMatchObject({
       lastRunStatus: "error",
       consecutiveErrors: 10,
     });
     expect(receipts(storePath, job.id)[0]).toMatchObject({ status: "error" });
-    const recovered = findCronTaskRunRecoveryInDatabase({
-      database: openOpenClawStateDatabase().db,
+    const recovered = taskCohortSyncBridge.inspectCronRunRecovery({
       jobId: job.id,
       startedAt: persisted!.state.lastRunAtMs!,
       storeKey: cronStoreKey(storePath),
     });
-    expect(recovered.finalized?.entry).toMatchObject({
+    expect(finalizedCronTaskRun(recovered.task ?? undefined, job.id)?.entry).toMatchObject({
       jobId: job.id,
       status: "error",
     });

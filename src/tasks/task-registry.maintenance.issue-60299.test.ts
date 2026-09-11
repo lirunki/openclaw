@@ -196,7 +196,7 @@ function createTaskRegistryMaintenanceHarness(params: {
       return next;
     },
     isRuntimeAuthoritative: () => params.runtimeAuthoritative ?? true,
-    listTaskRegistryRecordsByRuntimeSourceIdFromSqlite: ({ sourceId }) =>
+    listTaskRegistryRecordsByRuntimeSourceId: ({ sourceId }) =>
       sourceId ? (durableCronTaskRows[sourceId] ?? []) : Object.values(durableCronTaskRows).flat(),
   };
 

@@ -14,6 +14,7 @@ const signal = new Int32Array(data.signal);
 let closed = false;
 let pending = Promise.resolve();
 let pluginStateLoaded = false;
+let taskCohortLoaded = false;
 
 async function handleRequest(request: StorageSyncBridgeRequest): Promise<unknown> {
   switch (request.domain) {
@@ -30,6 +31,11 @@ async function handleRequest(request: StorageSyncBridgeRequest): Promise<unknown
           await import("../plugin-state/plugin-state-sync-bridge-handler.js");
         await closePluginStateSyncBridgeHandler();
       }
+      if (taskCohortLoaded) {
+        const { closeTaskCohortSyncBridgeHandler } =
+          await import("../tasks/task-cohort-sync-bridge-handler.js");
+        await closeTaskCohortSyncBridgeHandler();
+      }
       closed = true;
       return undefined;
     }
@@ -40,6 +46,14 @@ async function handleRequest(request: StorageSyncBridgeRequest): Promise<unknown
       // SAFETY: the plugin-state facade is the sole producer for this closed domain payload.
       const envelope = request.payload as Parameters<typeof handlePluginStateSyncBridgeRequest>[0];
       return await handlePluginStateSyncBridgeRequest(envelope);
+    }
+    case "task-cohort": {
+      taskCohortLoaded = true;
+      const { handleTaskCohortSyncBridgeRequest } =
+        await import("../tasks/task-cohort-sync-bridge-handler.js");
+      // SAFETY: the task-cohort facade is the sole producer for this closed domain payload.
+      const envelope = request.payload as Parameters<typeof handleTaskCohortSyncBridgeRequest>[0];
+      return await handleTaskCohortSyncBridgeRequest(envelope);
     }
     default:
       throw new Error("Unknown storage compatibility domain.");
@@ -56,9 +70,12 @@ function encodeResponse(response: StorageSyncBridgeResponse): string {
     generation: response.generation,
     requestId: response.requestId,
     ok: false,
-    error: serializeStorageSyncBridgeError(
-      new Error("Storage compatibility response exceeds the payload limit."),
-    ),
+    error: {
+      ...serializeStorageSyncBridgeError(
+        new Error("Storage compatibility response exceeds the payload limit."),
+      ),
+      outcomeUnknown: true,
+    },
   } satisfies StorageSyncBridgeResponse);
   return encoded;
 }

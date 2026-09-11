@@ -54,7 +54,7 @@ export type CronRunReceiptStatus =
   | "interrupted"
   | "superseded";
 
-type CronRunReceipt = {
+export type CronRunReceipt = {
   receiptId: string;
   storeKey: string;
   jobId: string;
@@ -515,13 +515,26 @@ export function claimCronRunReceiptInDatabase(params: {
   return claimed;
 }
 
-export function findActiveCronRunReceiptInDatabase(params: {
-  database: DatabaseSync;
-  storePath: string;
-  jobId: string;
-}): CronRunReceiptRecoveryCandidate | undefined {
-  const row = activeRow(params.database, cronStoreKey(params.storePath), params.jobId);
+export function findActiveCronRunReceiptInDatabase(
+  params: { database: DatabaseSync; jobId: string } & (
+    | { storePath: string }
+    | { storeKey: string }
+  ),
+): CronRunReceiptRecoveryCandidate | undefined {
+  const storeKey = "storeKey" in params ? params.storeKey : cronStoreKey(params.storePath);
+  const row = activeRow(params.database, storeKey, params.jobId);
   return row ? receiptHandle(receiptFromRow(row)) : undefined;
+}
+
+export function findCronRunReceiptByIdInDatabase(
+  database: DatabaseSync,
+  receiptId: string,
+): CronRunReceipt | undefined {
+  const row = executeSqliteQueryTakeFirstSync(
+    database,
+    query(database).selectFrom("cron_run_receipts").selectAll().where("receipt_id", "=", receiptId),
+  );
+  return row ? receiptFromRow(row) : undefined;
 }
 
 export function listActiveCronRunReceiptJobIdsInDatabase(

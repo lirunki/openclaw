@@ -4,6 +4,7 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../../state/openclaw-state-db.js";
+import { taskCohortSyncBridge } from "../../tasks/task-cohort-sync-bridge.js";
 import { setupCronServiceSuite, writeCronStoreSnapshot } from "../service.test-harness.js";
 import { loadCronStore, saveCronJobsStore } from "../store.js";
 import {
@@ -180,9 +181,15 @@ describe("atomic cron run recovery", () => {
     const state = makeState(storePath, startedAtMs);
     const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
     const database = openOpenClawStateDatabase().db;
+    taskCohortSyncBridge.inspectCronRunRecovery({
+      storeKey: receipt.storeKey,
+      jobId: job.id,
+      startedAt: startedAtMs,
+      receiptId: receipt.receiptId,
+    });
     // Fail the row write after receipt retirement, inside the real transaction.
     database.exec(`
-      CREATE TEMP TRIGGER reject_pending_recovery
+      CREATE TRIGGER reject_pending_recovery
       BEFORE UPDATE ON cron_jobs
       WHEN NEW.job_id = 'recovery-rollback'
         AND json_extract(NEW.state_json, '$.startupCatchupAtMs') IS NOT NULL

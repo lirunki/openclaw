@@ -19,8 +19,8 @@ import {
   buildPluginCompatibilityWarnings,
   buildPluginRegistrySnapshotReport,
 } from "../plugins/status.js";
+import { taskCohortSyncBridge } from "../tasks/task-cohort-sync-bridge.js";
 import { loadTaskFlowRegistryStateFromSqliteReadOnly } from "../tasks/task-flow-registry.store.sqlite.js";
-import { loadTaskRegistryStateFromSqliteReadOnly } from "../tasks/task-registry.store.sqlite.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
 
 type NoteWorkspaceStatusOptions = {
@@ -40,7 +40,7 @@ function collectTaskFlowRecoveryFindings(): TaskFlowRecoveryFinding[] {
     (left, right) => right.createdAt - left.createdAt,
   );
   const tasksByFlowId = new Map<string, TaskRecord[]>();
-  for (const task of loadTaskRegistryStateFromSqliteReadOnly().tasks.values()) {
+  for (const task of taskCohortSyncBridge.inspectReadOnly().snapshot.tasks) {
     const flowId = task.parentFlowId?.trim();
     if (flowId) {
       const linkedTasks = tasksByFlowId.get(flowId);

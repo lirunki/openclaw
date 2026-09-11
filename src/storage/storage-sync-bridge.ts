@@ -4,6 +4,7 @@ import { StorageSyncBridgeClient } from "./storage-sync-bridge-client.js";
 import type { StorageSyncBridgeDomain } from "./storage-sync-bridge-protocol.js";
 
 export {
+  StorageSyncBridgeOutcomeUnknownError,
   StorageSyncBridgeRemoteError,
   StorageSyncBridgeTimeoutError,
 } from "./storage-sync-bridge-client.js";

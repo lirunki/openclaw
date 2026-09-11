@@ -16,11 +16,11 @@ Facts in this notebook are labeled as follows:
 
 ## Current status
 
-**Status as of 2026-09-10:** Increment 1 is in progress. The shared single-flight worker mailbox is implemented, plugin state has been ported from one subprocess per operation to the reusable worker/pool path, and the canonical asynchronous task-cohort contracts are extracted. The SQLite cohort adapter, compatibility routing, and direct SQLite caller removal remain pending.
+**Status as of 2026-09-11:** Increments 1 and 2 are implemented for local review with SQLite still authoritative. The canonical asynchronous contract, self-validating operation IDs, no-table ambiguity reconciliation, SQLite cohort adapter, task mailbox protocol, compatibility facade, primary task/subagent/maintenance/history routing, and cron/task recovery cohort are present. Azure SQL is not activated for tasks.
 
-**Observed:** The task registry is the next bounded storage area, but the current source does not support a safe isolated switch of only `task_runs` to Azure SQL. The basic registry has an injectable store seam, while critical task operations still bypass that seam and join larger SQLite transactions.
+**Observed:** Task CRUD, execution binding, completion admission/settlement/blocking, conditional subagent/task/flow replacement, and cron run recovery now execute as named cohort operations. Cron recovery compares the exact cron job, active receipt, and selected task evidence before atomically writing the job and receipt; the production cron service no longer imports task-registry SQLite helpers.
 
-**Approved next increment:** define operation-oriented transaction-cohort contracts, keep SQLite authoritative, and add a temporary single-flight worker mailbox through which existing synchronous task mutations can invoke the canonical asynchronous storage operations. Do not activate Azure SQL for tasks in this increment.
+**Next increment:** define the complete Azure activation set for every companion row already represented by the cohort, then implement the Azure SQL schema, adapter, routing, and migration. Cron job and receipt rows used by recovery must become authoritative in the same selected backend transaction; moving tasks to Azure while ordinary cron persistence remains authoritative only in SQLite is not valid.
 
 ## Approved boundaries
 
@@ -254,7 +254,19 @@ The extracted operations cover:
 - subagent generation replacement with exact run changes, the canonical task activation, and an explicit mirrored Task Flow pair;
 - backend shutdown.
 
-Every mutation carries an operation ID. Task writes make the absent state explicit and cannot represent an orphan delivery row. Composite commands carry expected and next records; successful results carry the canonical committed records needed for publication. Reusing an operation ID for a different command is a typed conflict. Snapshot reads use deterministically ordered arrays rather than `Map` so the contract remains JSON-safe across the temporary mailbox.
+Every mutation carries an operation ID. Task writes make the absent state explicit and cannot represent an orphan delivery row. Composite commands carry expected and next records; successful results carry the canonical committed records needed for publication. Operation IDs are self-validating correlations rather than durable receipts: each ID combines a random intent nonce with a hash of the versioned, canonically serialized command. A malformed ID or a hash that does not match the command is a typed conflict. Snapshot reads use deterministically ordered arrays rather than `Map` so the contract remains JSON-safe across the temporary mailbox.
+
+### No-table commit-ambiguity reconciliation
+
+**Approved:** Task operations do not add an operation-receipt table or persist operation IDs in existing cohort rows. The operation ID detects changed input and correlates an immediate reconciliation attempt; it does not prove that a transaction committed.
+
+An initial execution may mutate only when the complete backend-owned cohort matches the command's exact expected state. After a mailbox timeout or another commit-ambiguous failure, the compatibility client retains the exact command and permits only reconciliation mode. The next task-cohort access reconciles that command before any other work. The backend then rereads every affected task, delivery, execution-binding, queue, subagent, and optional flow record in one authoritative snapshot:
+
+- if the complete cohort matches the command's exact next state, return `already-applied` with the current canonical records;
+- otherwise return a typed `outcome-unknown` without writing, including when the cohort has returned to the expected state;
+- never automatically replay the mutating form after commit ambiguity.
+
+Treating an expected-state match as permission to execute again would be unsafe after an ABA transition. After reconciliation, the compatibility process remains terminally fail-closed and requires a Gateway restart to reload all task, subagent, queue, and flow mirrors together. A fresh operation can be prepared only from that reloaded state. If later mutations have advanced the cohort, the original committed result is intentionally not reconstructed. This is weaker than durable exactly-once replay but preserves fail-closed behavior without new persistent state.
 
 Accepted restart-receipt reconciliation carries structured receipt and session-target evidence rather than a callback. While the temporary synchronous facade exists, the main-process owner must prepare that evidence only while holding the exact live acceptance; the backend independently rereads the named session before mutation. A future direct asynchronous caller must provide an equivalent authority revalidation mechanism after awaited work rather than treating the receipt as authority by itself.
 
@@ -276,11 +288,11 @@ The mailbox design is deliberately narrow:
 - sequence validation and typed error restoration;
 - no cache, authoritative task state, retry queue, callbacks, generic RPC, or transaction object in the worker protocol.
 
-The main process prepares a command, sends it to the worker, waits with a bounded `Atomics.wait`, synchronously receives the matching response with `receiveMessageOnPort`, and publishes returned records only after a successful commit. Timeout or malformed response poisons that worker generation, leaves process memory unchanged, returns a visible failure, and causes bounded worker replacement before another operation.
+The main process prepares a command, sends it to the worker, waits with a bounded `Atomics.wait`, synchronously receives the matching response with `receiveMessageOnPort`, and publishes returned records only after a successful commit. Timeout or malformed response poisons that worker generation, leaves process memory unchanged, returns a visible failure, and causes bounded worker replacement before another operation. Any follow-up for that command is reconciliation-only; worker replacement does not authorize replaying its mutation.
 
 The mailbox transport is shared by named compatibility consumers, while operation protocols, validation, errors, and transaction semantics remain domain-owned. Plugin state is the first consumer and task lifecycle is the second. This supersedes the earlier plugin-state-only restriction without making the mailbox a default path for other synchronous stores.
 
-Every mutation still needs an operation ID and idempotent reconciliation because a timeout can be commit-ambiguous. Interactive credential output may use inherited stderr, but credentials and secret values must never enter operation payloads, response payloads, or logs. Worker initialization receives only the process-stable runtime configuration needed to resolve the selected backend.
+Every mutation still needs a self-validating operation ID and exact postcondition reconciliation because a timeout can be commit-ambiguous. Operation IDs are not persisted and are not evidence of commit. Interactive credential output may use inherited stderr, but credentials and secret values must never enter operation payloads, response payloads, hashes, or logs. Worker initialization receives only the process-stable runtime configuration needed to resolve the selected backend.
 
 ### Compatibility lifetime
 
@@ -300,7 +312,7 @@ Azure task activation requires performance evidence for worker startup, pool reu
 4. Define narrow asynchronous, operation-oriented task-cohort contracts rather than snapshot replacement or SQL primitives.
 5. Implement those operations with the current SQLite owner.
 6. Preserve the existing synchronous task mutation surface through the temporary compatibility client.
-7. Add explicit expected-state, operation-ID, or generation checks needed for commit ambiguity and eventual Azure execution.
+7. Add self-validating operation IDs, exact expected/next-state checks, and a non-mutating reconciliation mode for commit ambiguity and eventual Azure execution.
 8. Route cron history, maintenance, execution binding, and administrative reads through backend-neutral contracts.
 9. Remove production direct imports of task-registry SQLite helpers outside the SQLite adapter and approved composite operation adapters.
 10. Keep SQLite authoritative and preserve all user-visible behavior.
@@ -309,15 +321,16 @@ Azure task activation requires performance evidence for worker startup, pool reu
 
 ### Increment 2: resolve composite transaction ownership
 
-**Proposed recommended direction:** move the narrowly coupled task transaction neighborhood under one selected backend transaction boundary. This includes the portions of the following stores required by task operations:
+**Implemented for the SQLite reference backend:** the narrowly coupled task transaction neighborhood is represented by named cohort operations under one selected backend transaction boundary. This includes the portions of the following stores required by task operations:
 
 - task rows and delivery state;
 - task-owned execution lifecycle bindings and receipt reads;
 - subagent completion and replacement state;
 - session delivery queue admission used by subagent completion;
-- mirrored Task Flow state used by conditional subagent replacement.
+- mirrored Task Flow state used by conditional subagent replacement;
+- the cron job, active run receipt, and selected task evidence used by run recovery.
 
-This does not necessarily require completing every feature of the broader audit, delivery, subagent, or Task Flow stores in the same change. It does require every cross-owner operation to use one authoritative backend and one atomic transaction.
+This does not necessarily require completing every feature of the broader audit, delivery, subagent, Task Flow, or cron stores in the same change. It does require every cross-owner operation to use one authoritative backend and one atomic transaction. The Azure activation set must therefore include authoritative routing for each companion row touched by these operations; it cannot leave ordinary writes for those rows in SQLite while cohort mutations target Azure SQL.
 
 **Blocked alternative:** redesign the composite operations as durable sagas or outboxes. This materially changes persistent-store, recovery, and projection semantics and requires explicit approval before implementation.
 
@@ -335,7 +348,7 @@ This does not necessarily require completing every feature of the broader audit,
 6. Route Doctor, status, backup, and operator inspection through the selected backend.
 7. Keep SQLite as the default and contract reference.
 
-Azure activation remains blocked until Increment 2's transaction boundary is resolved.
+Azure activation remains blocked until the Increment 2 companion rows have Azure SQL schema coverage and all of their ordinary writers route to the same selected backend.
 
 ### Increment 4: add offline migration
 
@@ -369,7 +382,7 @@ Both adapters must pass the same behavioral cases for:
 
 - empty restore and ordered snapshot load;
 - task creation with delivery state;
-- idempotent duplicate handling;
+- exact-next duplicate reconciliation without durable operation receipts;
 - expected-state update conflicts;
 - terminal precedence and late events;
 - cancellation and provisional subagent outcomes;
@@ -389,7 +402,7 @@ Required cases include:
 - delivery admission racing duplicate completion;
 - stale subagent replacement generation;
 - failure between related-row writes;
-- commit ambiguity and connection loss;
+- commit ambiguity and connection loss, including exact-next reconciliation and fail-closed expected-state ABA handling;
 - maintenance racing a fresh lifecycle update;
 - observer failure after a successful durable commit;
 - process restart after commit but before in-memory publication.
@@ -470,7 +483,53 @@ The task vertical is complete only when:
 
 **Rejected:** A general persistent-worker RPC framework. The approved mailbox is fixed, single-flight, limited to explicitly named compatibility surfaces, and has an explicit removal condition.
 
+### 2026-09-10 — No-table ambiguity reconciliation approved
+
+**Approved:** Do not add an operation-receipt table and do not store operation IDs in existing task-cohort rows. Use a random intent nonce plus a canonical command hash for self-validating correlation.
+
+**Approved:** After a commit-ambiguous failure, permit only a non-mutating reconciliation read. Return `already-applied` only when the complete cohort exactly matches the prepared next state; otherwise return `outcome-unknown`, even if current state matches the prepared expected state. Recovery reloads canonical state and creates a fresh operation.
+
+**Accepted tradeoff:** The backend cannot recover an original result after later mutations and does not provide durable exactly-once replay. It preserves safety by refusing automatic mutation after ambiguity.
+
+**Rejected:** Persisting a durable operation receipt, adding last-operation columns to hot task rows, or treating an expected-state match after timeout as permission to execute again.
+
 ## Evidence log
+
+### Cron/task recovery cohort — 2026-09-11
+
+- **Owner boundary:** one cron job row, its exact active run receipt, and the deterministically selected task recovery record.
+- **Files changed:** task cohort contract/validation/operation helpers, SQLite adapter, mailbox protocol/handler/facade, cron recovery planner, cron task recovery selector, receipt read helpers, and focused tests.
+- **Logical contract affected:** cron recovery now inspects a JSON-safe selected-backend snapshot, prepares the domain outcome in the main process, and atomically compare-commits the exact job/receipt/task cohort through the shared mailbox. Deferred notifications remain main-process values and are published only after an applied commit.
+- **SQLite proof:** 13 adapter tests passed, including a selected-task advancement race that leaves the cron job untouched. Seventy-seven cron recovery, lifecycle, and task-run tests passed, including transaction rollback when the worker-owned database rejects the cron job update. Focused owner-hardening proof passed for retained terminal task evidence after receipt-finalization rollback and durable task recovery before a post-commit process crash; the crash assertion now reflects Windows' exit-code representation of self-`SIGKILL` without weakening the Unix signal assertion.
+- **Concurrency/failure proof:** expected-state mismatches are typed conflicts and replan from a fresh snapshot with a bound of three attempts. Reconciliation is read-only and requires the complete next job, terminal receipt, and unchanged selected task evidence; task advancement cannot be overwritten. An `already-applied` execute result suppresses duplicate deferred notifications.
+- **Architecture proof:** production cron service code no longer imports task-registry SQLite helpers. SQLite row and receipt primitives are private to the SQLite cohort adapter for this operation; no database handle or callback crosses the contract or mailbox. Core production typechecking and the build passed; core test typechecking ran for 900 seconds without diagnostics and timed out.
+- **Azure SQL proof:** none. The Azure adapter, schema, and companion-store routing do not exist yet.
+- **Known gaps:** Azure activation must move the cohort's companion cron, receipt, subagent, queue, flow, and lifecycle-binding rows and all ordinary writers to one selected backend. Offline migration, Doctor/backup/status integration, performance proof, and live Azure proof remain pending.
+- **Rollback or recovery:** restore the former cron-owned SQLite recovery transaction and remove the two cron recovery cohort methods; no schema or persistent data format changed.
+
+### SQLite task cohort and compatibility routing — 2026-09-11
+
+- **Owner boundary:** task/delivery state, task execution binding, subagent completion admission/settlement/blocking, conditional subagent replacement, and the task-owned portions of queue and mirrored-flow transactions.
+- **Files changed:** task cohort contract/validation/operation helpers, SQLite adapter, mailbox protocol/handler/facade, task registry runtime routing, subagent composite owners, task reads used by cron history/maintenance/Doctor, and focused tests.
+- **Logical contract affected:** synchronous callers now invoke canonical asynchronous cohort operations through the shared single-flight worker. Commands carry exact expected/next state and self-validating IDs; reconciliation never mutates.
+- **SQLite proof:** the adapter passed 12 owner-boundary tests covering task/delivery atomicity, exact-next reconciliation, fail-closed expected-state handling, operation-ID integrity, completion admission/settlement, stale-projection rejection, blocked follow-up rollback, replacement, execution binding, and uncorrelated-command rejection.
+- **Mailbox proof:** healthy execute/reconcile behavior, retained-command reconciliation, terminal fail-closed restart behavior, and a real worker commit followed by an intentionally oversized/lost response passed. Oversized post-commit responses are classified as outcome unknown rather than ordinary remote errors.
+- **Lifecycle proof:** task registry/store/maintenance suites passed 237 tests. Four subagent completion/replacement/restart-acceptance files passed after moving failure-injection triggers from connection-local TEMP triggers to database-visible triggers required by the worker-owned connection. ACP task execution binding and cron-history coverage passed; one cron durable-fence test failed once because process start identity was unavailable and passed unchanged on focused rerun.
+- **Type/build/static proof:** core `tsgo`, production build, formatting, Oxlint, assertion safety, database-first legacy-store guard, dead-export analysis, import-cycle check, docs links, and diff checks passed. Core test typechecking ran for 600 seconds without diagnostics and timed out.
+- **Azure SQL proof:** none; tasks remain SQLite-authoritative and the task handler intentionally creates only the SQLite adapter.
+- **Known gaps at this checkpoint:** the cron-owned shared transaction was still pending and was subsequently moved by the cron/task recovery cohort increment above. Azure schema/store, backend routing, offline migration, Doctor/backup/status activation, performance proof, and live Azure proof remain pending.
+- **Rollback or recovery:** restore the previous direct SQLite task/composite owners and remove the task mailbox domain and adapter; no schema or persistent data format changed.
+
+### No-table ambiguity design — 2026-09-10
+
+- **Owner boundary:** task-cohort command validation and commit-ambiguity recovery only.
+- **Files changed:** this task vertical notebook.
+- **Logical contract affected:** planned task operations use self-validating correlation IDs and non-mutating exact-postcondition reconciliation instead of durable operation receipts.
+- **SQLite/Azure proof:** none; neither adapter implements this decision yet.
+- **Concurrency/failure proof:** the design fails closed on ABA by refusing mutation in reconciliation mode unless it is only reporting an exact complete next-state match.
+- **Operator-visible proof:** an unprovable ambiguous outcome remains visible as `outcome-unknown`; it is not hidden by retry.
+- **Known gaps:** revise the extracted result contract, implement canonical operation hashing and reconciliation mode, then prove both adapters against the same failure cases.
+- **Rollback or recovery:** documentation-only decision; no schema or persistent state changed.
 
 ### Task-cohort contract extraction — 2026-09-10
 
@@ -484,7 +543,7 @@ The task vertical is complete only when:
 - **Operator-visible proof:** none; this is a type-contract extraction.
 - **Focused tests:** no new runtime tests were added because the extraction has no executable behavior; under the test-audit authoring gate, tests that only restated TypeScript shapes would not provide independent proof.
 - **Type/build/docs proof:** core `tsgo`, focused Oxlint, dead-export analysis, formatting, docs links, assertion safety, import cycles, and diff checks passed. Core test typechecking produced no diagnostic before the 240-second command timeout; the stale artifact lock left by that timed-out runner was removed only after its recorded owner and related compiler processes were verified stopped, then core `tsgo` passed again. The path-scoped changed gate passed its first ten checks and stopped at the unrelated overdue `sdk-untrusted-context-identifier-aliases` compatibility record.
-- **Known gaps:** SQLite cohort implementation, task mailbox codec/handler/facade, direct SQLite caller removal, operation-ID persistence/reconciliation, composite authority proof, and all Azure task work.
+- **Known gaps:** SQLite cohort implementation, task mailbox codec/handler/facade, direct SQLite caller removal, no-table ambiguity reconciliation, composite authority proof, and all Azure task work.
 - **Rollback or recovery:** remove the unused contract module and return the execution-owner binding type to module-private scope; no persistent state changes.
 
 ### Shared mailbox and plugin-state port — 2026-09-10

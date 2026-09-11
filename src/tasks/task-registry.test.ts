@@ -288,7 +288,7 @@ function configureTaskRegistryMaintenanceRuntimeForTest(params: {
       return next;
     },
     isRuntimeAuthoritative: () => params.runtimeAuthoritative ?? true,
-    listTaskRegistryRecordsByRuntimeSourceIdFromSqlite: () => [],
+    listTaskRegistryRecordsByRuntimeSourceId: () => [],
   });
 }
 
@@ -3950,7 +3950,7 @@ describe("task-registry", () => {
         resolveTaskForLookupToken: () => undefined,
         setTaskCleanupAfterById: () => null,
         isRuntimeAuthoritative: () => true,
-        listTaskRegistryRecordsByRuntimeSourceIdFromSqlite: () => [],
+        listTaskRegistryRecordsByRuntimeSourceId: () => [],
       });
 
       try {
