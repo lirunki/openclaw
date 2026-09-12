@@ -47,10 +47,14 @@ export function serializeStorageSyncBridgeError(error: unknown): SerializedStora
   const code = error && typeof error === "object" ? Reflect.get(error, "code") : undefined;
   const operation =
     error && typeof error === "object" ? Reflect.get(error, "operation") : undefined;
+  const kind = error && typeof error === "object" ? Reflect.get(error, "kind") : undefined;
+  const outcomeUnknown =
+    error && typeof error === "object" ? Reflect.get(error, "outcomeUnknown") : undefined;
   return {
     name: error instanceof Error ? error.name : "Error",
     message: error instanceof Error ? error.message : String(error),
     ...(typeof code === "string" ? { code } : {}),
     ...(typeof operation === "string" ? { operation } : {}),
+    ...(kind === "ambiguous-commit" || outcomeUnknown === true ? { outcomeUnknown: true } : {}),
   };
 }

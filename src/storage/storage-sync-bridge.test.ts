@@ -4,6 +4,7 @@ import {
   StorageSyncBridgeClient,
   StorageSyncBridgeRemoteError,
 } from "./storage-sync-bridge-client.js";
+import { serializeStorageSyncBridgeError } from "./storage-sync-bridge-protocol.js";
 import { closeStorageSyncBridge, requestStorageSyncBridge } from "./storage-sync-bridge.js";
 
 const clients = new Set<StorageSyncBridgeClient>();
@@ -23,6 +24,19 @@ function createClient(options: { timeoutMs?: number; maxPayloadBytes?: number } 
 afterEach(async () => {
   await Promise.allSettled([...clients].map((client) => client.close()));
   clients.clear();
+});
+
+describe("storage sync bridge error protocol", () => {
+  it("preserves ambiguous database commit outcomes across the worker boundary", () => {
+    const error = Object.assign(new Error("commit response was lost"), {
+      kind: "ambiguous-commit",
+    });
+
+    expect(serializeStorageSyncBridgeError(error)).toMatchObject({
+      message: "commit response was lost",
+      outcomeUnknown: true,
+    });
+  });
 });
 
 describe("StorageSyncBridgeClient", () => {

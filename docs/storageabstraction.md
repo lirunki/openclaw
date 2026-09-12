@@ -1317,7 +1317,7 @@ The implementation may proceed autonomously through discovery, design refinement
 
 ## Execution status
 
-**Status:** Phase 0 decisions are approved. The project-registry and plugin-state vertical slices are implemented for local review, with SQLite remaining the default backend.
+**Status:** Phase 0 decisions are approved. The project-registry and plugin-state vertical slices are implemented for local review. The Azure SQL task-cohort schema and asynchronous adapter foundation are implemented but intentionally unselected while companion-store routing remains incomplete. SQLite remains the default backend.
 
 Implemented surfaces:
 
@@ -1331,7 +1331,7 @@ Implemented surfaces:
 - `src/storage/azure-sql/plugin-state-store.ts` implements asynchronous plugin-state operations, conditional writes, bounded imports, and Doctor-owned compare-and-delete repair.
 - `src/storage/plugin-state-store-factory.ts` selects and retains the Azure SQL plugin-state backend owner.
 - `src/storage/storage-sync-bridge.ts` and its worker provide the approved single-flight compatibility mailbox, with plugin state as the first consumer and task lifecycle planned as the second.
-- `src/storage/task-cohort-store.ts` defines the canonical asynchronous task transaction-cohort contract, and `src/storage/sqlite/task-cohort-store.ts` implements it for the still-authoritative SQLite backend through the shared compatibility mailbox. The cohort includes exact cron job, run-receipt, and selected-task recovery so the cron service no longer opens a task SQLite transaction directly.
+- `src/storage/task-cohort-store.ts` defines the canonical asynchronous task transaction-cohort contract, and `src/storage/sqlite/task-cohort-store.ts` implements it for the still-authoritative SQLite backend through the shared compatibility mailbox. `src/storage/azure-sql/task-cohort-schema.ts` and `src/storage/azure-sql/task-cohort-store.ts` now provide the unselected Azure physical schema and complete current cohort adapter. The cohort includes exact cron job, run-receipt, and selected-task recovery so the cron service no longer opens a task SQLite transaction directly.
 - `src/infra/state-migrations.plugin-state.ts` imports a stopped legacy SQLite plugin-state sidecar into the selected backend, preserves absolute timestamps, and archives the source only after every row is reconciled.
 
 The Azure SQL schema uses explicit binary collation and fixed-size hashes for long path, URL, and plugin-state lookup keys. Lease expiry is computed by Azure SQL; process-local lease deadlines are conservative and cannot outlive the database lease. Secret-backed authentication is resolved at the runtime boundary, and SQL passwords must be configured through `SecretRef`.
@@ -1354,7 +1354,7 @@ The migration remains incremental:
 
 - Only the project registry, its checkout lease, and plugin state are implemented for Azure SQL.
 - Doctor can import the retired plugin-state SQLite sidecar into Azure SQL and can conditionally remove unchanged plugin rows while revalidating its maintenance authority inside the Azure mutation transaction.
-- Sessions, transcripts, memory, cron, audit, task, delivery, and other stores remain SQLite-authoritative. Task operations now route through the SQLite cohort adapter, but no Azure SQL task schema or adapter is active.
+- Sessions, transcripts, memory, cron, audit, task, delivery, and other stores remain SQLite-authoritative. Task operations route through the SQLite cohort adapter. An Azure SQL task-cohort schema and adapter now exist for local review, but production selection remains intentionally blocked until every ordinary writer for the companion cron, queue, subagent, flow, scratch, authority, and execution-binding rows uses the same selected backend.
 - Backend-aware backup, status, and the complete multi-store offline migration command remain pending.
 - Backend selection must not imply that stores outside the migrated slices have moved.
 - SQLite remains the supported default and regression reference.

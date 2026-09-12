@@ -16,11 +16,11 @@ Facts in this notebook are labeled as follows:
 
 ## Current status
 
-**Status as of 2026-09-11:** Increments 1 and 2 are implemented for local review with SQLite still authoritative. The canonical asynchronous contract, self-validating operation IDs, no-table ambiguity reconciliation, SQLite cohort adapter, task mailbox protocol, compatibility facade, primary task/subagent/maintenance/history routing, and cron/task recovery cohort are present. Azure SQL is not activated for tasks.
+**Status as of 2026-09-11:** Increments 1 and 2 are implemented for local review with SQLite still authoritative. The first part of Increment 3 is also implemented locally: Azure SQL migration v4 defines the complete task-cohort physical schema, and the asynchronous Azure adapter implements every current `TaskCohortStore` operation with one transaction-owned cohort lock, exact expected/next comparisons, canonical JSON text, and non-mutating reconciliation. The Azure adapter is intentionally not activated because the ordinary cron, queue, subagent, flow, and execution-binding owners do not yet route all companion-row work to the selected backend.
 
 **Observed:** Task CRUD, execution binding, completion admission/settlement/blocking, conditional subagent/task/flow replacement, and cron run recovery now execute as named cohort operations. Cron recovery compares the exact cron job, active receipt, and selected task evidence before atomically writing the job and receipt; the production cron service no longer imports task-registry SQLite helpers.
 
-**Next increment:** define the complete Azure activation set for every companion row already represented by the cohort, then implement the Azure SQL schema, adapter, routing, and migration. Cron job and receipt rows used by recovery must become authoritative in the same selected backend transaction; moving tasks to Azure while ordinary cron persistence remains authoritative only in SQLite is not valid.
+**Next increment:** route every ordinary writer and reader for the implemented Azure activation set through backend-neutral owners, then activate the task mailbox against the selected store. The activation set is `task_runs`, `task_delivery_state`, `execution_owner_lifecycle_bindings`, `subagent_runs`, `delivery_queue_entries`, `flow_runs`, `cron_jobs`, `cron_run_receipts`, `cron_job_runtime_authorities`, and `cron_job_scratch`. Moving only cohort commands while ordinary companion writes remain authoritative in SQLite is not valid.
 
 ## Approved boundaries
 
@@ -338,17 +338,21 @@ This does not necessarily require completing every feature of the broader audit,
 
 ### Increment 3: implement and activate the Azure adapter
 
-**Proposed:**
+**Partially implemented:**
 
-1. Add task-specific Azure SQL migrations, tables, indexes, and constraints.
-2. Implement repository operations with Kysely-backed Azure helpers and explicit transactions.
-3. Add typed conflict, unavailable, retryable, and decode failure behavior.
-4. Add process-stable factory selection and trusted-runtime configuration routing.
-5. Close task-owned Azure resources during Gateway shutdown.
-6. Route Doctor, status, backup, and operator inspection through the selected backend.
-7. Keep SQLite as the default and contract reference.
+1. Azure SQL migration `global.task-cohort.v1` defines the ten-table activation set, binary-collated identities, fixed-width identity hashes, JSON checks, filtered receipt uniqueness, foreign keys, and query indexes.
+2. `AzureSqlTaskCohortStore` implements the complete current cohort contract with parameterized SQL and explicit transactions. A transaction-owned shared/exclusive application lock preserves one coherent snapshot and serializes absent-row compare/write decisions without exposing a transaction handle.
+3. Operation validation, exact canonical postcondition recognition, typed conflicts, read-only reconciliation, safe bigint decoding, JSON corruption failures, and commit-ambiguity propagation are present.
+4. The Azure task factory and runtime-option resolver retain pooled stores by endpoint and resolved authentication identity, distinguish injected credential objects, fingerprint resolved SQL passwords, and retire stores on close.
 
-Azure activation remains blocked until the Increment 2 companion rows have Azure SQL schema coverage and all of their ordinary writers route to the same selected backend.
+**Still proposed and required before activation:**
+
+5. Route ordinary companion-store readers and writers through the selected backend, then select the Azure factory from the task mailbox handler.
+6. Close task-owned Azure resources through the mailbox and Gateway shutdown lifecycle.
+7. Route Doctor, status, backup, and operator inspection through the selected backend.
+8. Keep SQLite as the default and contract reference.
+
+Azure activation remains blocked until all ordinary writers for the ten-table activation set route to the same selected backend. The adapter and schema must not be mistaken for a safe production switch while that routing is incomplete.
 
 ### Increment 4: add offline migration
 
@@ -494,6 +498,18 @@ The task vertical is complete only when:
 **Rejected:** Persisting a durable operation receipt, adding last-operation columns to hot task rows, or treating an expected-state match after timeout as permission to execute again.
 
 ## Evidence log
+
+### Azure SQL task-cohort adapter foundation — 2026-09-11
+
+- **Owner boundary:** the complete ten-table Azure physical activation set and every operation currently exposed by `TaskCohortStore`; runtime selection remains SQLite-only.
+- **Files changed:** Azure task-cohort schema, adapter, factory, runtime-option resolver, focused adapter/factory tests, and the storage notebooks.
+- **Logical contract affected:** no production routing change. The Azure adapter implements ordered snapshot reads, owner/runtime-source reads, task/delivery compare-replacement, task execution binding, subagent completion admission/settlement/blocking, subagent/task/flow replacement, and cron job/receipt/task recovery.
+- **Concurrency/failure behavior:** every mutation holds the transaction-owned exclusive `openclaw.task-cohort.v1` application lock. Snapshot and recovery inspection hold its shared form. Exact next state is recognized before mutation; reconciliation never writes; a failed transaction propagates and the Azure runtime classifies a failed commit as outcome-unknown.
+- **Schema behavior:** migration `global.task-cohort.v1` uses binary-collated original identities plus fixed-width SHA-256 lookup keys, canonical `nvarchar(max)` JSON text with validation, epoch-millisecond `bigint` fields, task/delivery cascade, cron authority cascade, and filtered uniqueness for one active cron receipt. Hash matches are followed by exact original-identity comparisons.
+- **Local proof:** 19 focused adapter, factory, and mailbox tests passed. They cover exact execute/reconcile behavior, ordered filtered reads, task/delivery rollback, correlated completion admission/settlement/replacement, blocked-completion rollback, execution binding, selected-task cron recovery conflict, read-only migration-free inspection, pool identity separation, credential/password rotation, lifecycle closure, and preservation of an Azure ambiguous-commit classification across the worker protocol. The SQL test double rejects unrecognized queries rather than treating them as empty results.
+- **Live Azure proof:** none. A connection preflight was rejected before health or schema work, so no migration or data mutation ran. The project notebook permits code and local-test work only unless a new live-proof authorization is explicit.
+- **Known gaps:** SQL Server syntax, constraints, filtered-index locking, and driver scalar behavior still require isolated real-backend proof. More importantly, the adapter is not production-reachable until ordinary queue, subagent, flow, cron, scratch, authority, and execution-binding owners route to the same selected backend. Offline migration and Doctor/status/backup integration remain pending.
+- **Rollback or recovery:** remove the unselected Azure adapter, schema, factory, and runtime options. No SQLite schema, runtime selection, or persistent data changed.
 
 ### Cron/task recovery cohort — 2026-09-11
 

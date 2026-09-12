@@ -119,6 +119,7 @@ print_manual_cleanup_hint() {
   printf '  project id: %s\n' "$DEMO_PROJECT_ID"
   printf '  plugin id:  %s\n' "$DEMO_PLUGIN_ID"
   printf '  repo root:  %s\n' "$DEMO_REPO_ROOT"
+  printf '  task ids:   %s-simple-task, %s-cohort-task\n' "$DEMO_PROJECT_ID" "$DEMO_PROJECT_ID"
   printf '%s\n' "Retry cleanup with the same IDs and your external credential file before using this database again."
 }
 
@@ -166,10 +167,10 @@ cd "$REPO_ROOT"
 heading "OpenClaw Azure SQL storage-abstraction demo"
 printf '%s\n' \
   "This demo uses the production AzureSqlDatabase, AzureSqlProjectRegistryStore," \
-  "AzureSqlPluginStateStore, and the shared synchronous mailbox. It creates one" \
-  "synthetic project, one short-lived checkout lease, and two plugin-state entries" \
-  "in the operator-approved isolated Azure SQL test database, then removes them." \
-  "No connection string, username, or password is printed."
+  "AzureSqlPluginStateStore, AzureSqlTaskCohortStore, and the shared synchronous" \
+  "mailbox. It creates one project, one short-lived checkout lease, two plugin-state" \
+  "entries, two tasks, and one task-delivery companion in the operator-approved" \
+  "isolated Azure SQL test database, then removes them. No credential is printed."
 
 if [[ ! -f "$SOURCE_CREDENTIAL_FILE" ]]; then
   color '1;31' "Credential file not found: $SOURCE_CREDENTIAL_FILE"
@@ -237,15 +238,38 @@ printf '%s\n' \
 printf '\nSQL file:\n  %s\n' "$RUNTIME_DIR/demo-queries.sql"
 pause_for_space "Press SPACE to remove the synthetic project and plugin state, then verify cleanup."
 
-heading "Stage 3: cleanup through the storage contract"
+heading "Stage 3: cleanup project and plugin state through their storage contracts"
 touch "$RUNTIME_DIR/cleanup"
 wait "$HOLDER_PID"
 HOLDER_PID=""
 cat "$RUNTIME_DIR/cleanup-result.json"
+
+heading "Stage 4A: simple Azure SQL task API"
+printf '%s\n' \
+  "Create one task with no delivery companion, then read it by exact runtime/source" \
+  "and through its owner-key listing. The task adapter is used directly because" \
+  "production task backend selection intentionally remains disabled."
+
+heading "Stage 4B: atomic Azure SQL task cohort"
+printf '%s\n' \
+  "Create a second task together with its delivery-state companion, atomically" \
+  "advance both rows, then reconcile the same command as already-applied."
+runner task-demo | tee "$RUNTIME_DIR/task-demo-result.json"
+
+heading "Inspect the task API and cohort rows"
+printf '%s\n' \
+  "Run the generated SQL again. Expected now: project=0, lease=0, plugin state=0," \
+  "task rows=2, task delivery rows=1. The cohort task must be running and its" \
+  "last_notified_event_at_ms must match the atomic next state reported above."
+printf '\nSQL file:\n  %s\n' "$RUNTIME_DIR/demo-queries.sql"
+pause_for_space "Press SPACE after inspecting the simple task and task cohort."
+
+heading "Stage 5: cleanup task rows through the task cohort contract"
+runner cleanup | tee "$RUNTIME_DIR/task-cleanup-result.json"
 CLEANUP_COMPLETE=1
 
 heading "Demo passed"
-color '1;32' "Azure SQL health, migrations, lease ownership, project reads, plugin-state"
-color '1;32' "direct and mailbox reads, worker/pool reuse, persistence, and cleanup succeeded."
-printf '\nScope reminder: this proves the project-registry and plugin-state vertical slices. Other OpenClaw stores remain SQLite-backed.\n'
+color '1;32' "Azure SQL project, plugin-state, simple task API, and atomic task cohort"
+color '1;32' "operations, persistence, reconciliation, inspection, and cleanup succeeded."
+printf '\nScope reminder: the task adapter is direct demo-only evidence; production task routing remains SQLite-authoritative until all companion owners can select Azure SQL together.\n'
 printf 'Temporary local demo files will now be removed.\n'
